@@ -1,5 +1,6 @@
 mod auth;
 mod docs;
+mod tokens;
 mod users;
 
 use anyhow::{Context, Result, bail};
@@ -15,6 +16,8 @@ use std::sync::Arc;
 pub struct AppState {
     pub users: users::Users,
     pub docs: docs::Docs,
+    pub tokens: tokens::Tokens,
+    pub base_url: String,
     pub oidc: Arc<auth::Oidc>,
     pub key: Key,
     pub secure_cookies: bool,
@@ -53,6 +56,7 @@ async fn main() -> Result<()> {
     }
     let files_dir = std::env::var("FILES_DIR").unwrap_or_else(|_| "data/files".into());
     let docs = docs::Docs::open(&db_path, &files_dir)?;
+    let tokens = tokens::Tokens::open(&db_path)?;
     let oidc = auth::Oidc::discover(
         env("GOOGLE_CLIENT_ID")?,
         env("GOOGLE_CLIENT_SECRET")?,
@@ -68,6 +72,12 @@ async fn main() -> Result<()> {
         .route("/healthz", get(|| async { "ok" }))
         .route("/privacy", get(auth::privacy))
         .route("/terms", get(auth::terms))
+        .route("/tokens", get(tokens::tokens_page).post(tokens::tokens_issue))
+        .route("/tokens/revoke", post(tokens::tokens_revoke))
+        .route(
+            "/api/upload",
+            post(tokens::api_upload).layer(DefaultBodyLimit::max(docs::MAX_BYTES + 64 * 1024)),
+        )
         .route("/upload", get(docs::upload_page))
         // 파일 한도(10MB)에 다른 입력칸 몫만 더한다. 넘으면 업로드 처리에서 안내한다.
         .route(
@@ -90,6 +100,8 @@ async fn main() -> Result<()> {
         .with_state(AppState {
             users,
             docs,
+            tokens,
+            base_url: base_url.clone(),
             oidc: Arc::new(oidc),
             key: Key::from(session_key.as_bytes()),
             secure_cookies: base_url.starts_with("https://"),

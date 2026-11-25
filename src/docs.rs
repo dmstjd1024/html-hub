@@ -368,7 +368,7 @@ fn now_unix() -> i64 {
 }
 
 /// 한국 시간으로 "2026-11-25 14:03" 꼴로 보인다.
-fn show_time(unix: i64) -> String {
+pub fn show_time(unix: i64) -> String {
     let Ok(t) = OffsetDateTime::from_unix_timestamp(unix) else {
         return String::new();
     };
@@ -455,7 +455,7 @@ pub async fn index(
     let empty = if docs.is_empty() { "<p>문서가 없습니다.</p>" } else { "" };
 
     page(&format!(
-        "<p>{}님, 안녕하세요. <a href=\"/upload\">올리기</a> \
+        "<p>{}님, 안녕하세요. <a href=\"/upload\">올리기</a> <a href=\"/tokens\">토큰</a> \
          <form method=\"post\" action=\"/logout\" style=\"display:inline\"><button>로그아웃</button></form></p>\
          <form method=\"get\" action=\"/\">\
          <input name=\"q\" value=\"{}\" placeholder=\"제목, 올린 사람, 본문\"> \
@@ -507,13 +507,13 @@ pub async fn upload_page(State(app): State<AppState>, jar: PrivateCookieJar) -> 
 
 const BAD_FILE: &str = "파일이 너무 크거나 올바르지 않습니다. 10MB 이하의 HTML 파일만 올릴 수 있습니다.";
 
-struct Form {
-    title: String,
-    project: String,
-    file: Option<(String, axum::body::Bytes)>,
+pub struct Form {
+    pub title: String,
+    pub project: String,
+    pub file: Option<(String, axum::body::Bytes)>,
 }
 
-async fn read_form(mut form: Multipart) -> Result<Form, &'static str> {
+pub async fn read_form(mut form: Multipart) -> Result<Form, &'static str> {
     let mut out = Form { title: String::new(), project: String::new(), file: None };
     while let Some(field) = form.next_field().await.map_err(|_| BAD_FILE)? {
         let name = field.name().unwrap_or_default().to_owned();
@@ -530,7 +530,7 @@ async fn read_form(mut form: Multipart) -> Result<Form, &'static str> {
 }
 
 /// 올린 파일이 규칙(U3·U4)에 맞는지 본다. 맞으면 내용을 돌려준다.
-fn check_file(file: Option<(String, axum::body::Bytes)>) -> Result<axum::body::Bytes, &'static str> {
+pub fn check_file(file: Option<(String, axum::body::Bytes)>) -> Result<axum::body::Bytes, &'static str> {
     let Some((filename, bytes)) = file.filter(|(_, b)| !b.is_empty()) else {
         return Err("HTML 파일을 선택해 주세요.");
     };
