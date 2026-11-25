@@ -47,7 +47,7 @@ async fn main() -> Result<()> {
     let base_url = std::env::var("BASE_URL").unwrap_or_else(|_| "http://localhost:3000".into());
     let session_key = env("SESSION_KEY")?;
     if session_key.len() < 64 {
-        bail!("SESSION_KEY 는 64자 이상이어야 한다 (예: openssl rand -base64 64)");
+        bail!("SESSION_KEY 는 64자 이상이어야 한다 (예: openssl rand -base64 64 | tr -d '\\n')");
     }
     let oidc = auth::Oidc::discover(
         env("GOOGLE_CLIENT_ID")?,
