@@ -212,11 +212,14 @@ pub async fn callback(
             );
             (jar.remove(expired(OAUTH_COOKIE)).add(session), Redirect::to("/")).into_response()
         }
-        Ok(None) => (
+        Ok(None) => {
+            eprintln!("명단에 없는 로그인 시도: {email}");
+            (
             StatusCode::FORBIDDEN,
             page("등록되지 않았거나 비활성화된 계정입니다. IT 팀에 문의하세요."),
-        )
-            .into_response(),
+            )
+                .into_response()
+        }
         Err(e) => {
             eprintln!("명단 조회 실패: {e}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
