@@ -62,6 +62,8 @@ async fn main() -> Result<()> {
         .route("/auth/callback", get(auth::callback))
         .route("/logout", post(auth::logout))
         .route("/healthz", get(|| async { "ok" }))
+        .route("/privacy", get(auth::privacy))
+        .route("/terms", get(auth::terms))
         .with_state(AppState {
             users,
             oidc: Arc::new(oidc),
