@@ -22,6 +22,12 @@ use time::{OffsetDateTime, UtcOffset};
 pub const MAX_BYTES: usize = 10 * 1024 * 1024;
 const LIST_LIMIT: i64 = 200;
 
+pub struct Version {
+    pub n: i64,
+    pub by_name: String,
+    pub created_at: i64,
+}
+
 pub struct Doc {
     pub id: String,
     pub title: String,
@@ -52,7 +58,21 @@ impl Docs {
                 uploader_name TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
                 deleted_at INTEGER
-            )",
+            );
+            -- 문서마다 버전이 쌓인다. 현재 버전은 번호가 가장 큰 것이다. 파일은 한 번 쓰면 바꾸지 않는다.
+            CREATE TABLE IF NOT EXISTS versions (
+                doc_id TEXT NOT NULL,
+                n INTEGER NOT NULL,
+                file TEXT NOT NULL,
+                by_email TEXT NOT NULL,
+                by_name TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (doc_id, n)
+            );
+            -- 버전 기능이 생기기 전에 올린 문서는 1번 버전으로 채운다.
+            INSERT INTO versions (doc_id, n, file, by_email, by_name, created_at)
+                SELECT id, 1, id || '.html', uploader_email, uploader_name, created_at FROM documents
+                WHERE id NOT IN (SELECT doc_id FROM versions);",
         )?;
         std::fs::create_dir_all(dir)?;
         Ok(Self {
@@ -61,24 +81,97 @@ impl Docs {
         })
     }
 
-    fn put_file(&self, id: &str, bytes: &[u8]) -> Result<()> {
-        Ok(std::fs::write(self.dir.join(format!("{id}.html")), bytes)?)
+    fn put_file(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        Ok(std::fs::write(self.dir.join(name), bytes)?)
     }
 
-    fn read_file(&self, id: &str) -> Result<Vec<u8>> {
-        Ok(std::fs::read(self.dir.join(format!("{id}.html")))?)
+    fn read_file(&self, name: &str) -> Result<Vec<u8>> {
+        Ok(std::fs::read(self.dir.join(name))?)
     }
 
     /// 새 문서를 저장하고 추측할 수 없는 번호를 돌려준다. 파일을 먼저 쓰고 기록을 남긴다.
     pub fn insert(&self, title: &str, project: &str, by: &crate::users::User, bytes: &[u8]) -> Result<String> {
         let id = CsrfToken::new_random().secret().clone();
-        self.put_file(&id, bytes)?;
-        self.db.lock().unwrap().execute(
+        let file = format!("{id}.html");
+        self.put_file(&file, bytes)?;
+        let now = now_unix();
+        let mut conn = self.db.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT INTO documents (id, title, project, uploader_email, uploader_name, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, title, project, by.email, by.name, now_unix()],
+            params![id, title, project, by.email, by.name, now],
         )?;
+        tx.execute(
+            "INSERT INTO versions (doc_id, n, file, by_email, by_name, created_at) VALUES (?1, 1, ?2, ?3, ?4, ?5)",
+            params![id, file, by.email, by.name, now],
+        )?;
+        tx.commit()?;
         Ok(id)
+    }
+
+    fn add_version(&self, id: &str, by: &crate::users::User, file_for: impl FnOnce(i64) -> Result<String>) -> Result<i64> {
+        let conn = self.db.lock().unwrap();
+        let n: i64 = conn.query_row("SELECT COALESCE(MAX(n), 0) + 1 FROM versions WHERE doc_id = ?1", [id], |r| r.get(0))?;
+        let file = file_for(n)?;
+        conn.execute(
+            "INSERT INTO versions (doc_id, n, file, by_email, by_name, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, n, file, by.email, by.name, now_unix()],
+        )?;
+        Ok(n)
+    }
+
+    /// 같은 문서에 새 버전을 올린다. 이전 버전은 이력으로 남는다 (정책서 V1·V2).
+    pub fn replace(&self, id: &str, by: &crate::users::User, bytes: &[u8]) -> Result<i64> {
+        self.add_version(id, by, |n| {
+            let file = format!("{id}-{n}.html");
+            self.put_file(&file, bytes)?;
+            Ok(file)
+        })
+    }
+
+    /// 이전 버전의 내용을 새 버전으로 한 번 더 저장한다. 사이의 버전은 지우지 않는다 (V8). 없는 버전이면 None.
+    pub fn restore(&self, id: &str, n: i64, by: &crate::users::User) -> Result<Option<i64>> {
+        let Some(file) = self.version_file(id, n)? else { return Ok(None) };
+        // 파일은 바뀌지 않으므로 같은 파일을 새 버전이 가리키게 한다.
+        Ok(Some(self.add_version(id, by, |_| Ok(file))?))
+    }
+
+    fn version_file(&self, id: &str, n: i64) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT file FROM versions WHERE doc_id = ?1 AND n = ?2", params![id, n], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// 최신 버전이 먼저 온다.
+    pub fn versions(&self, id: &str) -> Result<Vec<Version>> {
+        let conn = self.db.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT n, by_name, created_at FROM versions WHERE doc_id = ?1 ORDER BY n DESC",
+        )?;
+        let rows = stmt.query_map([id], |r| Ok(Version { n: r.get(0)?, by_name: r.get(1)?, created_at: r.get(2)? }))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// 현재(가장 큰 번호) 버전의 내용.
+    pub fn read(&self, id: &str) -> Result<Vec<u8>> {
+        let file: String = self.db.lock().unwrap().query_row(
+            "SELECT file FROM versions WHERE doc_id = ?1 ORDER BY n DESC LIMIT 1",
+            [id],
+            |r| r.get(0),
+        )?;
+        self.read_file(&file)
+    }
+
+    /// 특정 버전의 내용. 없는 버전이면 None.
+    pub fn read_version(&self, id: &str, n: i64) -> Result<Option<Vec<u8>>> {
+        match self.version_file(id, n)? {
+            Some(file) => Ok(Some(self.read_file(&file)?)),
+            None => Ok(None),
+        }
     }
 
     /// 삭제(숨김)되지 않은 문서만 돌려준다.
@@ -92,10 +185,6 @@ impl Docs {
                 row_to_doc,
             )
             .optional()?)
-    }
-
-    pub fn read(&self, id: &str) -> Result<Vec<u8>> {
-        self.read_file(id)
     }
 
     /// 제목 또는 올린 사람에 검색어가 든 문서를 최신순으로 돌려준다. `project` 가 비어 있지 않으면 그 프로젝트만.
@@ -216,8 +305,7 @@ pub async fn index(
     let rows: String = docs
         .iter()
         .map(|d| {
-            let can_delete = d.uploader_email == user.email || user.is_admin();
-            let delete = if can_delete {
+            let delete = if can_modify(&user, d) {
                 format!(
                     "<form method=\"post\" action=\"/d/{}/delete\" style=\"display:inline\">\
                      <button>삭제</button></form>",
@@ -227,12 +315,13 @@ pub async fn index(
                 String::new()
             };
             format!(
-                "<tr><td><a href=\"/d/{}\">{}</a></td><td>{}</td><td>{}</td><td>{}</td><td>{delete}</td></tr>",
+                "<tr><td><a href=\"/d/{}\">{}</a></td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"/d/{}/history\">이력</a> {delete}</td></tr>",
                 escape(&d.id),
                 escape(&d.title),
                 if d.project.is_empty() { "미분류".into() } else { escape(&d.project) },
                 escape(&d.uploader_name),
                 show_time(d.created_at),
+                escape(&d.id),
             )
         })
         .collect();
@@ -289,49 +378,225 @@ pub async fn upload_page(State(app): State<AppState>, jar: PrivateCookieJar) -> 
     }
 }
 
-pub async fn upload(State(app): State<AppState>, jar: PrivateCookieJar, mut form: Multipart) -> Response {
+const BAD_FILE: &str = "파일이 너무 크거나 올바르지 않습니다. 10MB 이하의 HTML 파일만 올릴 수 있습니다.";
+
+struct Form {
+    title: String,
+    project: String,
+    file: Option<(String, axum::body::Bytes)>,
+}
+
+async fn read_form(mut form: Multipart) -> Result<Form, &'static str> {
+    let mut out = Form { title: String::new(), project: String::new(), file: None };
+    while let Some(field) = form.next_field().await.map_err(|_| BAD_FILE)? {
+        let name = field.name().unwrap_or_default().to_owned();
+        let filename = field.file_name().unwrap_or_default().to_owned();
+        let bytes = field.bytes().await.map_err(|_| BAD_FILE)?;
+        match name.as_str() {
+            "title" => out.title = String::from_utf8_lossy(&bytes).trim().to_owned(),
+            "project" => out.project = String::from_utf8_lossy(&bytes).trim().to_owned(),
+            "file" => out.file = Some((filename, bytes)),
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// 올린 파일이 규칙(U3·U4)에 맞는지 본다. 맞으면 내용을 돌려준다.
+fn check_file(file: Option<(String, axum::body::Bytes)>) -> Result<axum::body::Bytes, &'static str> {
+    let Some((filename, bytes)) = file.filter(|(_, b)| !b.is_empty()) else {
+        return Err("HTML 파일을 선택해 주세요.");
+    };
+    let lower = filename.to_lowercase();
+    if !(lower.ends_with(".html") || lower.ends_with(".htm")) {
+        return Err(".html 파일만 올릴 수 있습니다.");
+    }
+    if bytes.len() > MAX_BYTES {
+        return Err("파일이 10MB 를 넘습니다.");
+    }
+    Ok(bytes)
+}
+
+pub async fn upload(State(app): State<AppState>, jar: PrivateCookieJar, form: Multipart) -> Response {
     let user = match current_user(&app, &jar) {
         Ok(u) => u,
         Err(r) => return r,
     };
-    let (mut title, mut project, mut file) = (String::new(), String::new(), None);
-    loop {
-        let field = match form.next_field().await {
-            Ok(Some(f)) => f,
-            Ok(None) => break,
-            Err(_) => return upload_form(&app, "파일이 너무 크거나 올바르지 않습니다. 10MB 이하의 HTML 파일만 올릴 수 있습니다."),
-        };
-        let name = field.name().unwrap_or_default().to_owned();
-        let filename = field.file_name().unwrap_or_default().to_owned();
-        let Ok(bytes) = field.bytes().await else {
-            return upload_form(&app, "파일이 너무 크거나 올바르지 않습니다. 10MB 이하의 HTML 파일만 올릴 수 있습니다.");
-        };
-        match name.as_str() {
-            "title" => title = String::from_utf8_lossy(&bytes).trim().to_owned(),
-            "project" => project = String::from_utf8_lossy(&bytes).trim().to_owned(),
-            "file" => file = Some((filename, bytes)),
-            _ => {}
-        }
-    }
-    if title.is_empty() {
+    let form = match read_form(form).await {
+        Ok(f) => f,
+        Err(msg) => return upload_form(&app, msg),
+    };
+    if form.title.is_empty() {
         return upload_form(&app, "제목을 입력해 주세요.");
     }
-    if title.chars().count() > 200 || project.chars().count() > 100 {
+    if form.title.chars().count() > 200 || form.project.chars().count() > 100 {
         return upload_form(&app, "제목은 200자, 프로젝트는 100자 이하로 입력해 주세요.");
     }
-    let Some((filename, bytes)) = file.filter(|(_, b)| !b.is_empty()) else {
-        return upload_form(&app, "HTML 파일을 선택해 주세요.");
+    let bytes = match check_file(form.file) {
+        Ok(b) => b,
+        Err(msg) => return upload_form(&app, msg),
     };
-    let lower = filename.to_lowercase();
-    if !(lower.ends_with(".html") || lower.ends_with(".htm")) {
-        return upload_form(&app, ".html 파일만 올릴 수 있습니다.");
-    }
-    if bytes.len() > MAX_BYTES {
-        return upload_form(&app, "파일이 10MB 를 넘습니다.");
-    }
-    match app.docs.insert(&title, &project, &user, &bytes) {
+    match app.docs.insert(&form.title, &form.project, &user, &bytes) {
         Ok(id) => Redirect::to(&format!("/uploaded/{id}")).into_response(),
         Err(e) => server_error("문서 저장", e),
+    }
+}
+
+fn can_modify(user: &crate::users::User, doc: &Doc) -> bool {
+    doc.uploader_email == user.email || user.is_admin()
+}
+
+/// 로그인한 직원과 삭제되지 않은 문서를 함께 돌려준다. 안 되면 그대로 돌려줄 응답을 에러로 준다.
+fn user_and_doc(
+    app: &AppState,
+    jar: &PrivateCookieJar,
+    id: &str,
+) -> Result<(crate::users::User, Doc), Response> {
+    let user = current_user_next(app, jar, &format!("/d/{id}"))?;
+    match app.docs.get(id) {
+        Ok(Some(doc)) => Ok((user, doc)),
+        Ok(None) => Err(not_found()),
+        Err(e) => Err(server_error("문서 조회", e)),
+    }
+}
+
+fn forbidden() -> Response {
+    (StatusCode::FORBIDDEN, page("올린 사람이나 관리자만 할 수 있습니다.")).into_response()
+}
+
+fn replace_form(doc: &Doc, error: &str) -> Response {
+    let status = if error.is_empty() { StatusCode::OK } else { StatusCode::BAD_REQUEST };
+    let error = if error.is_empty() { String::new() } else { format!("<p style=\"color:#c00\">{}</p>", escape(error)) };
+    (
+        status,
+        page(&format!(
+            "<h1>새 버전 올리기: {}</h1>{error}\
+             <p>링크는 그대로이고 내용만 새 파일로 바뀝니다. 이전 버전은 이력에 남습니다.</p>\
+             <form method=\"post\" action=\"/d/{id}/replace\" enctype=\"multipart/form-data\">\
+             <p><label>HTML 파일 (10MB 이하) <input type=\"file\" name=\"file\" accept=\".html,.htm\" required></label></p>\
+             <button>올리기</button></form><p><a href=\"/d/{id}/history\">이력으로</a></p>",
+            escape(&doc.title),
+            id = escape(&doc.id),
+        )),
+    )
+        .into_response()
+}
+
+pub async fn replace_page(State(app): State<AppState>, jar: PrivateCookieJar, Path(id): Path<String>) -> Response {
+    match user_and_doc(&app, &jar, &id) {
+        Ok((user, doc)) if can_modify(&user, &doc) => replace_form(&doc, ""),
+        Ok(_) => forbidden(),
+        Err(r) => r,
+    }
+}
+
+pub async fn replace(
+    State(app): State<AppState>,
+    jar: PrivateCookieJar,
+    Path(id): Path<String>,
+    form: Multipart,
+) -> Response {
+    let (user, doc) = match user_and_doc(&app, &jar, &id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if !can_modify(&user, &doc) {
+        return forbidden();
+    }
+    let form = match read_form(form).await {
+        Ok(f) => f,
+        Err(msg) => return replace_form(&doc, msg),
+    };
+    let bytes = match check_file(form.file) {
+        Ok(b) => b,
+        Err(msg) => return replace_form(&doc, msg),
+    };
+    match app.docs.replace(&id, &user, &bytes) {
+        Ok(_) => Redirect::to(&format!("/d/{id}/history")).into_response(),
+        Err(e) => server_error("새 버전 저장", e),
+    }
+}
+
+pub async fn history(State(app): State<AppState>, jar: PrivateCookieJar, Path(id): Path<String>) -> Response {
+    let (user, doc) = match user_and_doc(&app, &jar, &id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let versions = match app.docs.versions(&id) {
+        Ok(v) => v,
+        Err(e) => return server_error("이력 조회", e),
+    };
+    let modify = can_modify(&user, &doc);
+    let latest = versions.first().map(|v| v.n);
+    let rows: String = versions
+        .iter()
+        .map(|v| {
+            let current = if Some(v.n) == latest { " (현재)" } else { "" };
+            let restore = if modify && Some(v.n) != latest {
+                format!(
+                    "<form method=\"post\" action=\"/d/{}/restore/{}\" style=\"display:inline\">\
+                     <button>이 버전으로 되돌리기</button></form>",
+                    escape(&doc.id),
+                    v.n
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "<tr><td>{}{current}</td><td>{}</td><td>{}</td><td><a href=\"/d/{}/v/{}\">열기</a></td><td>{restore}</td></tr>",
+                v.n,
+                escape(&v.by_name),
+                show_time(v.created_at),
+                escape(&doc.id),
+                v.n,
+            )
+        })
+        .collect();
+    let replace_link = if modify {
+        format!(" <a href=\"/d/{}/replace\">새 버전 올리기</a>", escape(&doc.id))
+    } else {
+        String::new()
+    };
+    page(&format!(
+        "<h1>{}</h1><p><a href=\"/d/{id}\">현재 버전 열기</a>{replace_link} <a href=\"/\">목록으로</a></p>\
+         <table><tr><th>버전</th><th>올린 사람</th><th>올린 시각</th><th></th><th></th></tr>{rows}</table>",
+        escape(&doc.title),
+        id = escape(&doc.id),
+    ))
+    .into_response()
+}
+
+pub async fn view_version(
+    State(app): State<AppState>,
+    jar: PrivateCookieJar,
+    Path((id, n)): Path<(String, i64)>,
+) -> Response {
+    if let Err(r) = user_and_doc(&app, &jar, &id) {
+        return r;
+    }
+    match app.docs.read_version(&id, n) {
+        Ok(Some(bytes)) => document_response(bytes),
+        Ok(None) => not_found(),
+        Err(e) => server_error("문서 파일 읽기", e),
+    }
+}
+
+pub async fn restore(
+    State(app): State<AppState>,
+    jar: PrivateCookieJar,
+    Path((id, n)): Path<(String, i64)>,
+) -> Response {
+    let (user, doc) = match user_and_doc(&app, &jar, &id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if !can_modify(&user, &doc) {
+        return forbidden();
+    }
+    match app.docs.restore(&id, n, &user) {
+        Ok(Some(_)) => Redirect::to(&format!("/d/{id}/history")).into_response(),
+        Ok(None) => not_found(),
+        Err(e) => server_error("되돌리기", e),
     }
 }
 
@@ -378,7 +643,7 @@ pub async fn delete(State(app): State<AppState>, jar: PrivateCookieJar, Path(id)
         Ok(None) => return not_found(),
         Err(e) => return server_error("문서 조회", e),
     };
-    if doc.uploader_email != user.email && !user.is_admin() {
+    if !can_modify(&user, &doc) {
         return (StatusCode::FORBIDDEN, page("올린 사람이나 관리자만 삭제할 수 있습니다.")).into_response();
     }
     match app.docs.hide(&id) {
@@ -444,6 +709,57 @@ mod tests {
         assert!(d.list("", "").unwrap().is_empty());
         assert!(d.projects().unwrap().is_empty());
         assert_eq!(d.read(&id).unwrap(), b"x");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn 새_버전을_올려도_이전_버전이_남고_현재_버전이_바뀐다() {
+        let (d, dir) = docs();
+        let (a, b) = (user("a@x.im", "가나"), user("b@x.im", "다라"));
+        let id = d.insert("문서", "", &a, b"v1").unwrap();
+        assert_eq!(d.replace(&id, &b, b"v2").unwrap(), 2);
+        assert_eq!(d.read(&id).unwrap(), b"v2");
+        assert_eq!(d.read_version(&id, 1).unwrap().unwrap(), b"v1");
+        let v = d.versions(&id).unwrap();
+        assert_eq!((v[0].n, v[0].by_name.as_str(), v[1].n), (2, "다라", 1));
+        assert!(d.read_version(&id, 9).unwrap().is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn 되돌리면_옛_내용이_새_버전으로_저장되고_중간_버전은_남는다() {
+        let (d, dir) = docs();
+        let a = user("a@x.im", "가나");
+        let id = d.insert("문서", "", &a, b"v1").unwrap();
+        d.replace(&id, &a, b"v2").unwrap();
+        assert_eq!(d.restore(&id, 1, &a).unwrap(), Some(3));
+        assert_eq!(d.read(&id).unwrap(), b"v1");
+        assert_eq!(d.read_version(&id, 2).unwrap().unwrap(), b"v2");
+        assert_eq!(d.versions(&id).unwrap().len(), 3);
+        assert_eq!(d.restore(&id, 9, &a).unwrap(), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn 버전_기능_이전에_올린_문서는_1번_버전으로_채운다() {
+        let dir = std::env::temp_dir().join(format!("html-hub-test-{}", CsrfToken::new_random().secret()));
+        let db = dir.join("h.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE documents (id TEXT PRIMARY KEY, title TEXT NOT NULL, project TEXT NOT NULL,
+               uploader_email TEXT NOT NULL, uploader_name TEXT NOT NULL, created_at INTEGER NOT NULL, deleted_at INTEGER);
+             INSERT INTO documents VALUES ('old1', '옛 문서', '', 'a@x.im', '가나', 100, NULL);",
+        )
+        .unwrap();
+        drop(conn);
+        std::fs::write(dir.join("old1.html"), b"legacy").unwrap();
+        // 옛 파일이 있는 폴더를 파일 폴더로 쓴다.
+        let d = Docs::open(db.to_str().unwrap(), dir.to_str().unwrap()).unwrap();
+        assert_eq!(d.read("old1").unwrap(), b"legacy");
+        assert_eq!(d.versions("old1").unwrap().len(), 1);
+        let a = user("a@x.im", "가나");
+        assert_eq!(d.replace("old1", &a, b"new").unwrap(), 2);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

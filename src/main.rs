@@ -77,6 +77,14 @@ async fn main() -> Result<()> {
         .route("/uploaded/{id}", get(docs::uploaded))
         .route("/d/{id}", get(docs::view))
         .route("/d/{id}/delete", post(docs::delete))
+        .route("/d/{id}/history", get(docs::history))
+        .route("/d/{id}/v/{n}", get(docs::view_version))
+        .route("/d/{id}/restore/{n}", post(docs::restore))
+        .route("/d/{id}/replace", get(docs::replace_page))
+        .route(
+            "/d/{id}/replace",
+            post(docs::replace).layer(DefaultBodyLimit::max(docs::MAX_BYTES + 64 * 1024)),
+        )
         .with_state(AppState {
             users,
             docs,
