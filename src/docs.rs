@@ -72,13 +72,43 @@ impl Docs {
             -- 버전 기능이 생기기 전에 올린 문서는 1번 버전으로 채운다.
             INSERT INTO versions (doc_id, n, file, by_email, by_name, created_at)
                 SELECT id, 1, id || '.html', uploader_email, uploader_name, created_at FROM documents
-                WHERE id NOT IN (SELECT doc_id FROM versions);",
+                WHERE id NOT IN (SELECT doc_id FROM versions);
+            -- 본문 검색용으로 문서마다 현재 버전의 보이는 글자만 둔다 (정책서 F2, D4-3).
+            CREATE TABLE IF NOT EXISTS bodies (doc_id TEXT PRIMARY KEY, text TEXT NOT NULL);",
         )?;
         std::fs::create_dir_all(dir)?;
-        Ok(Self {
+        let docs = Self {
             db: Arc::new(Mutex::new(conn)),
             dir: dir.into(),
-        })
+        };
+        docs.index_missing()?;
+        Ok(docs)
+    }
+
+    /// 본문 색인이 없는 문서(색인 기능 이전에 올린 문서)를 현재 버전 파일로 채운다.
+    fn index_missing(&self) -> Result<()> {
+        let ids: Vec<String> = {
+            let conn = self.db.lock().unwrap();
+            let mut stmt = conn.prepare("SELECT id FROM documents WHERE id NOT IN (SELECT doc_id FROM bodies)")?;
+            stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+        };
+        for id in ids {
+            // 파일을 못 읽는 문서는 건너뛴다. 제목·올린 사람 검색에는 영향이 없다.
+            if let Ok(bytes) = self.read(&id) {
+                self.index_body(&id, &bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn index_body(&self, id: &str, bytes: &[u8]) -> Result<()> {
+        let text = visible_text(&String::from_utf8_lossy(bytes));
+        self.db.lock().unwrap().execute(
+            "INSERT INTO bodies (doc_id, text) VALUES (?1, ?2)
+             ON CONFLICT(doc_id) DO UPDATE SET text = excluded.text",
+            params![id, text],
+        )?;
+        Ok(())
     }
 
     fn put_file(&self, name: &str, bytes: &[u8]) -> Result<()> {
@@ -107,6 +137,8 @@ impl Docs {
             params![id, file, by.email, by.name, now],
         )?;
         tx.commit()?;
+        drop(conn);
+        self.index_body(&id, bytes)?;
         Ok(id)
     }
 
@@ -123,18 +155,22 @@ impl Docs {
 
     /// 같은 문서에 새 버전을 올린다. 이전 버전은 이력으로 남는다 (정책서 V1·V2).
     pub fn replace(&self, id: &str, by: &crate::users::User, bytes: &[u8]) -> Result<i64> {
-        self.add_version(id, by, |n| {
+        let n = self.add_version(id, by, |n| {
             let file = format!("{id}-{n}.html");
             self.put_file(&file, bytes)?;
             Ok(file)
-        })
+        })?;
+        self.index_body(id, bytes)?;
+        Ok(n)
     }
 
     /// 이전 버전의 내용을 새 버전으로 한 번 더 저장한다. 사이의 버전은 지우지 않는다 (V8). 없는 버전이면 None.
     pub fn restore(&self, id: &str, n: i64, by: &crate::users::User) -> Result<Option<i64>> {
         let Some(file) = self.version_file(id, n)? else { return Ok(None) };
         // 파일은 바뀌지 않으므로 같은 파일을 새 버전이 가리키게 한다.
-        Ok(Some(self.add_version(id, by, |_| Ok(file))?))
+        let n = self.add_version(id, by, |_| Ok(file.clone()))?;
+        self.index_body(id, &self.read_file(&file)?)?;
+        Ok(Some(n))
     }
 
     fn version_file(&self, id: &str, n: i64) -> Result<Option<String>> {
@@ -187,15 +223,17 @@ impl Docs {
             .optional()?)
     }
 
-    /// 제목 또는 올린 사람에 검색어가 든 문서를 최신순으로 돌려준다. `project` 가 비어 있지 않으면 그 프로젝트만.
+    /// 제목, 올린 사람, 본문(현재 버전의 보이는 글자)에 검색어가 든 문서를 최신순으로 돌려준다. `project` 가 비어 있지 않으면 그 프로젝트만.
     /// LIKE 대신 instr 를 써서 검색어의 % 나 _ 가 특수문자로 해석되지 않게 한다.
+    /// shortcut: 본문을 전부 훑는다. 문서가 수천 건을 넘어 느려지면 FTS5(trigram)로 바꾼다.
     pub fn list(&self, q: &str, project: &str) -> Result<Vec<Doc>> {
         let conn = self.db.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, title, project, uploader_email, uploader_name, created_at
              FROM documents
              WHERE deleted_at IS NULL
-               AND (?1 = '' OR instr(lower(title), lower(?1)) > 0 OR instr(lower(uploader_name), lower(?1)) > 0)
+               AND (?1 = '' OR instr(lower(title), lower(?1)) > 0 OR instr(lower(uploader_name), lower(?1)) > 0
+                    OR EXISTS (SELECT 1 FROM bodies b WHERE b.doc_id = documents.id AND instr(lower(b.text), lower(?1)) > 0))
                AND (?2 = '' OR project = ?2)
              ORDER BY created_at DESC, rowid DESC
              LIMIT ?3",
@@ -222,6 +260,44 @@ impl Docs {
         )?;
         Ok(())
     }
+}
+
+/// HTML 에서 화면에 보이는 글자만 뽑는다 (정책서 F2). 태그, 주석, script·style 안의 내용은 뺀다.
+fn visible_text(html: &str) -> String {
+    let lower = html.to_ascii_lowercase(); // 길이가 같아서 같은 위치로 자를 수 있다
+    let (mut out, mut i) = (String::new(), 0);
+    while i < html.len() {
+        let rest = &lower[i..];
+        let starts_tag = rest
+            .strip_prefix('<')
+            .and_then(|r| r.chars().next())
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '/' || c == '!');
+        if rest.starts_with("<!--") {
+            i += rest.find("-->").map_or(rest.len(), |e| e + 3);
+        } else if rest.starts_with("<script") || rest.starts_with("<style") {
+            let close = if rest.starts_with("<script") { "</script" } else { "</style" };
+            i += rest
+                .find(close)
+                .and_then(|e| rest[e..].find('>').map(|g| e + g + 1))
+                .unwrap_or(rest.len());
+            out.push(' ');
+        } else if starts_tag {
+            i += rest.find('>').map_or(rest.len(), |e| e + 1);
+            out.push(' ');
+        } else {
+            let ch = html[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    let out = out
+        .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&");
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn row_to_doc(row: &rusqlite::Row) -> rusqlite::Result<Doc> {
@@ -331,7 +407,7 @@ pub async fn index(
         "<p>{}님, 안녕하세요. <a href=\"/upload\">올리기</a> \
          <form method=\"post\" action=\"/logout\" style=\"display:inline\"><button>로그아웃</button></form></p>\
          <form method=\"get\" action=\"/\">\
-         <input name=\"q\" value=\"{}\" placeholder=\"제목 또는 올린 사람\"> \
+         <input name=\"q\" value=\"{}\" placeholder=\"제목, 올린 사람, 본문\"> \
          <select name=\"project\"><option value=\"\">모든 프로젝트</option>{options}</select> \
          <button>검색</button></form>\
          <table><tr><th>제목</th><th>프로젝트</th><th>올린 사람</th><th>올린 시각</th><th></th></tr>{rows}</table>{empty}",
@@ -760,6 +836,33 @@ mod tests {
         assert_eq!(d.versions("old1").unwrap().len(), 1);
         let a = user("a@x.im", "가나");
         assert_eq!(d.replace("old1", &a, b"new").unwrap(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn 보이는_글자만_뽑는다() {
+        let t = visible_text("<html><head><title>제목</title><style>.a{color:red}</style></head><body><!-- 숨김 -->\
+            <h1 class=\"x\">안녕&nbsp;하세요</h1><script>var secret = 'zzz';</script><p>a &lt; b &amp; c</p>3 < 4</body></html>");
+        assert_eq!(t, "제목 안녕 하세요 a < b & c 3 < 4");
+        assert!(!t.contains("secret") && !t.contains("color") && !t.contains("숨김"));
+        assert_eq!(visible_text("<SCRIPT>x</SCRIPT>끝"), "끝");
+        assert_eq!(visible_text("열린 <b"), "열린");
+    }
+
+    #[test]
+    fn 본문으로_찾고_교체_되돌리기_숨기기를_따른다() {
+        let (d, dir) = docs();
+        let a = user("a@x.im", "가나");
+        let id = d.insert("보고", "", &a, "<p>분기 매출 요약</p><script>토큰</script>".as_bytes()).unwrap();
+        assert_eq!(d.list("매출", "").unwrap().len(), 1);
+        assert_eq!(d.list("토큰", "").unwrap().len(), 0, "script 안의 글자는 찾지 않는다");
+        d.replace(&id, &a, "<p>새 내용</p>".as_bytes()).unwrap();
+        assert_eq!(d.list("매출", "").unwrap().len(), 0, "이전 버전 본문은 색인하지 않는다");
+        assert_eq!(d.list("새 내용", "").unwrap().len(), 1);
+        d.restore(&id, 1, &a).unwrap();
+        assert_eq!(d.list("매출", "").unwrap().len(), 1);
+        d.hide(&id).unwrap();
+        assert_eq!(d.list("매출", "").unwrap().len(), 0, "숨긴 문서는 본문으로도 안 나온다");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
