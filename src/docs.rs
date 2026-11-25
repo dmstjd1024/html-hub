@@ -22,6 +22,14 @@ use time::{OffsetDateTime, UtcOffset};
 pub const MAX_BYTES: usize = 10 * 1024 * 1024;
 const LIST_LIMIT: i64 = 200;
 
+pub struct Comment {
+    pub id: i64,
+    pub by_email: String,
+    pub by_name: String,
+    pub body: String,
+    pub created_at: i64,
+}
+
 pub struct Version {
     pub n: i64,
     pub by_name: String,
@@ -74,7 +82,17 @@ impl Docs {
                 SELECT id, 1, id || '.html', uploader_email, uploader_name, created_at FROM documents
                 WHERE id NOT IN (SELECT doc_id FROM versions);
             -- 본문 검색용으로 문서마다 현재 버전의 보이는 글자만 둔다 (정책서 F2, D4-3).
-            CREATE TABLE IF NOT EXISTS bodies (doc_id TEXT PRIMARY KEY, text TEXT NOT NULL);",
+            CREATE TABLE IF NOT EXISTS bodies (doc_id TEXT PRIMARY KEY, text TEXT NOT NULL);
+            -- 댓글은 지우면 화면에서만 숨기고 기록은 남긴다.
+            CREATE TABLE IF NOT EXISTS comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                doc_id TEXT NOT NULL,
+                by_email TEXT NOT NULL,
+                by_name TEXT NOT NULL,
+                body TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                deleted_at INTEGER
+            );",
         )?;
         std::fs::create_dir_all(dir)?;
         let docs = Self {
@@ -208,6 +226,40 @@ impl Docs {
             Some(file) => Ok(Some(self.read_file(&file)?)),
             None => Ok(None),
         }
+    }
+
+    pub fn add_comment(&self, id: &str, by: &crate::users::User, body: &str) -> Result<()> {
+        self.db.lock().unwrap().execute(
+            "INSERT INTO comments (doc_id, by_email, by_name, body, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, by.email, by.name, body, now_unix()],
+        )?;
+        Ok(())
+    }
+
+    /// 지우지 않은 댓글을 오래된 것부터 돌려준다.
+    pub fn comments(&self, id: &str) -> Result<Vec<Comment>> {
+        let conn = self.db.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, by_email, by_name, body, created_at FROM comments
+             WHERE doc_id = ?1 AND deleted_at IS NULL ORDER BY id",
+        )?;
+        let rows = stmt.query_map([id], |r| {
+            Ok(Comment { id: r.get(0)?, by_email: r.get(1)?, by_name: r.get(2)?, body: r.get(3)?, created_at: r.get(4)? })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// 그 문서의 지우지 않은 댓글 하나.
+    pub fn comment(&self, id: &str, comment_id: i64) -> Result<Option<Comment>> {
+        Ok(self.comments(id)?.into_iter().find(|c| c.id == comment_id))
+    }
+
+    pub fn hide_comment(&self, comment_id: i64) -> Result<()> {
+        self.db.lock().unwrap().execute(
+            "UPDATE comments SET deleted_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
+            params![comment_id, now_unix()],
+        )?;
+        Ok(())
     }
 
     /// 삭제(숨김)되지 않은 문서만 돌려준다.
@@ -391,13 +443,12 @@ pub async fn index(
                 String::new()
             };
             format!(
-                "<tr><td><a href=\"/d/{}\">{}</a></td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"/d/{}/history\">이력</a> {delete}</td></tr>",
-                escape(&d.id),
+                "<tr><td><a href=\"/d/{id}\">{}</a></td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"/d/{id}/history\">이력</a> <a href=\"/d/{id}/comments\">댓글</a> {delete}</td></tr>",
                 escape(&d.title),
                 if d.project.is_empty() { "미분류".into() } else { escape(&d.project) },
                 escape(&d.uploader_name),
                 show_time(d.created_at),
-                escape(&d.id),
+                id = escape(&d.id),
             )
         })
         .collect();
@@ -642,6 +693,108 @@ pub async fn history(State(app): State<AppState>, jar: PrivateCookieJar, Path(id
     .into_response()
 }
 
+const MAX_COMMENT: usize = 2000;
+
+fn comments_page(doc: &Doc, user: &crate::users::User, comments: &[Comment], error: &str) -> Response {
+    let status = if error.is_empty() { StatusCode::OK } else { StatusCode::BAD_REQUEST };
+    let error = if error.is_empty() { String::new() } else { format!("<p style=\"color:#c00\">{}</p>", escape(error)) };
+    let id = escape(&doc.id);
+    let items: String = comments
+        .iter()
+        .map(|c| {
+            let delete = if c.by_email == user.email || user.is_admin() {
+                format!(
+                    "<form method=\"post\" action=\"/d/{id}/comments/{}/delete\" style=\"display:inline\"><button>삭제</button></form>",
+                    c.id
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "<li><b>{}</b> {} {delete}<div style=\"white-space:pre-wrap\">{}</div></li>",
+                escape(&c.by_name),
+                show_time(c.created_at),
+                escape(&c.body)
+            )
+        })
+        .collect();
+    let empty = if comments.is_empty() { "<p>댓글이 없습니다.</p>" } else { "" };
+    (
+        status,
+        page(&format!(
+            "<h1>{}</h1><p><a href=\"/d/{id}\">문서 열기</a> <a href=\"/d/{id}/history\">이력</a> <a href=\"/\">목록으로</a></p>\
+             <h2>댓글</h2>{empty}<ul>{items}</ul>{error}\
+             <form method=\"post\" action=\"/d/{id}/comments\"><p><textarea name=\"body\" rows=\"4\" cols=\"60\" maxlength=\"{MAX_COMMENT}\" required></textarea></p>\
+             <button>댓글 남기기</button></form>",
+            escape(&doc.title)
+        )),
+    )
+        .into_response()
+}
+
+pub async fn comments_view(State(app): State<AppState>, jar: PrivateCookieJar, Path(id): Path<String>) -> Response {
+    let (user, doc) = match user_and_doc(&app, &jar, &id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    match app.docs.comments(&id) {
+        Ok(list) => comments_page(&doc, &user, &list, ""),
+        Err(e) => server_error("댓글 조회", e),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CommentForm {
+    body: String,
+}
+
+pub async fn comment_add(
+    State(app): State<AppState>,
+    jar: PrivateCookieJar,
+    Path(id): Path<String>,
+    axum::Form(form): axum::Form<CommentForm>,
+) -> Response {
+    let (user, doc) = match user_and_doc(&app, &jar, &id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let body = form.body.trim();
+    let list = || app.docs.comments(&id).unwrap_or_default();
+    if body.is_empty() {
+        return comments_page(&doc, &user, &list(), "댓글 내용을 입력해 주세요.");
+    }
+    if body.chars().count() > MAX_COMMENT {
+        return comments_page(&doc, &user, &list(), "댓글은 2000자 이하로 입력해 주세요.");
+    }
+    match app.docs.add_comment(&id, &user, body) {
+        Ok(()) => Redirect::to(&format!("/d/{id}/comments")).into_response(),
+        Err(e) => server_error("댓글 저장", e),
+    }
+}
+
+pub async fn comment_delete(
+    State(app): State<AppState>,
+    jar: PrivateCookieJar,
+    Path((id, cid)): Path<(String, i64)>,
+) -> Response {
+    let (user, _) = match user_and_doc(&app, &jar, &id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let c = match app.docs.comment(&id, cid) {
+        Ok(Some(c)) => c,
+        Ok(None) => return not_found(),
+        Err(e) => return server_error("댓글 조회", e),
+    };
+    if c.by_email != user.email && !user.is_admin() {
+        return (StatusCode::FORBIDDEN, page("쓴 사람이나 관리자만 지울 수 있습니다.")).into_response();
+    }
+    match app.docs.hide_comment(cid) {
+        Ok(()) => Redirect::to(&format!("/d/{id}/comments")).into_response(),
+        Err(e) => server_error("댓글 삭제", e),
+    }
+}
+
 pub async fn view_version(
     State(app): State<AppState>,
     jar: PrivateCookieJar,
@@ -863,6 +1016,22 @@ mod tests {
         assert_eq!(d.list("매출", "").unwrap().len(), 1);
         d.hide(&id).unwrap();
         assert_eq!(d.list("매출", "").unwrap().len(), 0, "숨긴 문서는 본문으로도 안 나온다");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn 댓글은_오래된_것부터_나오고_지우면_숨겨진다() {
+        let (d, dir) = docs();
+        let (a, b) = (user("a@x.im", "가나"), user("b@x.im", "다라"));
+        let id = d.insert("문서", "", &a, b"x").unwrap();
+        d.add_comment(&id, &a, "첫 댓글").unwrap();
+        d.add_comment(&id, &b, "둘째").unwrap();
+        let list = d.comments(&id).unwrap();
+        assert_eq!((list[0].body.as_str(), list[1].by_name.as_str()), ("첫 댓글", "다라"));
+        d.hide_comment(list[0].id).unwrap();
+        assert_eq!(d.comments(&id).unwrap().len(), 1);
+        assert!(d.comment(&id, list[0].id).unwrap().is_none());
+        assert!(d.comment("다른문서", list[1].id).unwrap().is_none(), "다른 문서의 댓글 번호로는 못 찾는다");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

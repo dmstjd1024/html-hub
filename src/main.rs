@@ -78,6 +78,8 @@ async fn main() -> Result<()> {
         .route("/d/{id}", get(docs::view))
         .route("/d/{id}/delete", post(docs::delete))
         .route("/d/{id}/history", get(docs::history))
+        .route("/d/{id}/comments", get(docs::comments_view).post(docs::comment_add))
+        .route("/d/{id}/comments/{cid}/delete", post(docs::comment_delete))
         .route("/d/{id}/v/{n}", get(docs::view_version))
         .route("/d/{id}/restore/{n}", post(docs::restore))
         .route("/d/{id}/replace", get(docs::replace_page))
