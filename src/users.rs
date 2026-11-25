@@ -9,6 +9,13 @@ pub struct Users(Arc<Mutex<Connection>>);
 pub struct User {
     pub email: String,
     pub name: String,
+    pub role: String,
+}
+
+impl User {
+    pub fn is_admin(&self) -> bool {
+        self.role == "admin"
+    }
 }
 
 // 구글 관리 콘솔 "사용자 다운로드" JSON 형식 그대로다.
@@ -70,12 +77,13 @@ impl Users {
         let conn = self.0.lock().unwrap();
         Ok(conn
             .query_row(
-                "SELECT email, name FROM users WHERE email = ?1 AND active = 1",
+                "SELECT email, name, role FROM users WHERE email = ?1 AND active = 1",
                 [email.trim().to_lowercase()],
                 |row| {
                     Ok(User {
                         email: row.get(0)?,
                         name: row.get(1)?,
+                        role: row.get(2)?,
                     })
                 },
             )

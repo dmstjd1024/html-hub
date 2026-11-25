@@ -1,10 +1,11 @@
 mod auth;
+mod docs;
 mod users;
 
 use anyhow::{Context, Result, bail};
 use axum::{
     Router,
-    extract::FromRef,
+    extract::{DefaultBodyLimit, FromRef},
     routing::{get, post},
 };
 use axum_extra::extract::cookie::Key;
@@ -13,6 +14,7 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct AppState {
     pub users: users::Users,
+    pub docs: docs::Docs,
     pub oidc: Arc<auth::Oidc>,
     pub key: Key,
     pub secure_cookies: bool,
@@ -49,6 +51,8 @@ async fn main() -> Result<()> {
     if session_key.len() < 64 {
         bail!("SESSION_KEY 는 64자 이상이어야 한다 (예: openssl rand -base64 64 | tr -d '\\n')");
     }
+    let files_dir = std::env::var("FILES_DIR").unwrap_or_else(|_| "data/files".into());
+    let docs = docs::Docs::open(&db_path, &files_dir)?;
     let oidc = auth::Oidc::discover(
         env("GOOGLE_CLIENT_ID")?,
         env("GOOGLE_CLIENT_SECRET")?,
@@ -57,15 +61,25 @@ async fn main() -> Result<()> {
     .await?;
 
     let app = Router::new()
-        .route("/", get(auth::home))
+        .route("/", get(docs::index))
         .route("/login", get(auth::login))
         .route("/auth/callback", get(auth::callback))
         .route("/logout", post(auth::logout))
         .route("/healthz", get(|| async { "ok" }))
         .route("/privacy", get(auth::privacy))
         .route("/terms", get(auth::terms))
+        .route("/upload", get(docs::upload_page))
+        // 파일 한도(10MB)에 다른 입력칸 몫만 더한다. 넘으면 업로드 처리에서 안내한다.
+        .route(
+            "/upload",
+            post(docs::upload).layer(DefaultBodyLimit::max(docs::MAX_BYTES + 64 * 1024)),
+        )
+        .route("/uploaded/{id}", get(docs::uploaded))
+        .route("/d/{id}", get(docs::view))
+        .route("/d/{id}/delete", post(docs::delete))
         .with_state(AppState {
             users,
+            docs,
             oidc: Arc::new(oidc),
             key: Key::from(session_key.as_bytes()),
             secure_cookies: base_url.starts_with("https://"),

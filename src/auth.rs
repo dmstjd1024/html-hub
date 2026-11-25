@@ -1,4 +1,4 @@
-use crate::AppState;
+use crate::{AppState, users::User};
 use anyhow::Result;
 use axum::{
     extract::{Query, State},
@@ -81,7 +81,7 @@ fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
-fn escape(s: &str) -> String {
+pub(crate) fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -89,7 +89,7 @@ fn escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-fn page(body: &str) -> Html<String> {
+pub(crate) fn page(body: &str) -> Html<String> {
     Html(format!(
         "<!doctype html><html lang=\"ko\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
@@ -227,22 +227,22 @@ pub async fn callback(
     }
 }
 
-pub async fn home(State(app): State<AppState>, jar: PrivateCookieJar) -> Response {
-    let Some(email) = session_email(&jar) else {
-        return Redirect::to("/login").into_response();
+/// 로그인한 활성 직원을 돌려준다. 아니면 그대로 돌려줄 응답(로그인 이동 등)을 에러로 준다.
+pub fn current_user(app: &AppState, jar: &PrivateCookieJar) -> Result<User, Response> {
+    let Some(email) = session_email(jar) else {
+        return Err(Redirect::to("/login").into_response());
     };
     // 로그인 뒤에 계정이 비활성화됐을 수 있으므로 매번 명단을 다시 본다.
     match app.users.find_active(&email) {
-        Ok(Some(user)) => page(&format!(
-            "<p>{}님, 안녕하세요.</p>\
-             <form method=\"post\" action=\"/logout\"><button>로그아웃</button></form>",
-            escape(&user.name)
-        ))
-        .into_response(),
-        Ok(None) => (jar.remove(expired(SESSION_COOKIE)), Redirect::to("/login")).into_response(),
+        Ok(Some(user)) => Ok(user),
+        Ok(None) => Err((
+            jar.clone().remove(expired(SESSION_COOKIE)),
+            Redirect::to("/login"),
+        )
+            .into_response()),
         Err(e) => {
             eprintln!("명단 조회 실패: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            Err(StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
     }
 }
