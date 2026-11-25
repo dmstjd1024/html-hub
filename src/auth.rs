@@ -61,6 +61,9 @@ struct Pending {
     state: String,
     nonce: String,
     verifier: String,
+    // 로그인 뒤에 돌아갈 문서 주소. 안전한 값만 담는다 (safe_next).
+    #[serde(default)]
+    next: String,
 }
 
 fn cookie(secure: bool, name: &'static str, value: String, max_age: Duration) -> Cookie<'static> {
@@ -104,7 +107,25 @@ fn session_email(jar: &PrivateCookieJar) -> Option<String> {
     (exp.parse::<u64>().ok()? > now_unix()).then(|| email.to_owned())
 }
 
-pub async fn login(State(app): State<AppState>, jar: PrivateCookieJar) -> impl IntoResponse {
+#[derive(Deserialize)]
+pub struct LoginQuery {
+    next: Option<String>,
+}
+
+/// 로그인 뒤 돌아갈 곳은 "/d/<문서번호>" 꼴만 받는다. 아무 주소나 받으면 다른 사이트로 보내는 통로가 된다.
+fn safe_next(next: &str) -> String {
+    match next.strip_prefix("/d/") {
+        Some(id) if !id.is_empty() && id.len() <= 64
+            && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') => next.to_owned(),
+        _ => "/".to_owned(),
+    }
+}
+
+pub async fn login(
+    State(app): State<AppState>,
+    jar: PrivateCookieJar,
+    Query(q): Query<LoginQuery>,
+) -> impl IntoResponse {
     let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
     let (url, state, nonce) = app
         .oidc
@@ -121,6 +142,7 @@ pub async fn login(State(app): State<AppState>, jar: PrivateCookieJar) -> impl I
         state: state.secret().clone(),
         nonce: nonce.secret().clone(),
         verifier: verifier.secret().clone(),
+        next: safe_next(&q.next.unwrap_or_default()),
     };
     let c = cookie(
         app.secure_cookies,
@@ -145,7 +167,7 @@ async fn verified_email(
     app: &AppState,
     jar: &PrivateCookieJar,
     q: CallbackQuery,
-) -> Result<String, Failure> {
+) -> Result<(String, String), Failure> {
     const RETRY: &str = "로그인 세션이 만료되었습니다. 처음부터 다시 시도하세요.";
     if q.error.is_some() {
         return Err((StatusCode::UNAUTHORIZED, "로그인이 취소되었습니다."));
@@ -188,7 +210,7 @@ async fn verified_email(
     }
     claims
         .email()
-        .map(|e| e.as_str().to_owned())
+        .map(|e| (e.as_str().to_owned(), pending.next))
         .ok_or((StatusCode::FORBIDDEN, "이메일 정보를 받지 못했습니다."))
 }
 
@@ -197,8 +219,8 @@ pub async fn callback(
     jar: PrivateCookieJar,
     Query(q): Query<CallbackQuery>,
 ) -> Response {
-    let email = match verified_email(&app, &jar, q).await {
-        Ok(email) => email,
+    let (email, next) = match verified_email(&app, &jar, q).await {
+        Ok(v) => v,
         Err((status, msg)) => return (status, page(&escape(msg))).into_response(),
     };
     match app.users.find_active(&email) {
@@ -210,7 +232,7 @@ pub async fn callback(
                 format!("{}|{exp}", user.email),
                 Duration::hours(SESSION_HOURS),
             );
-            (jar.remove(expired(OAUTH_COOKIE)).add(session), Redirect::to("/")).into_response()
+            (jar.remove(expired(OAUTH_COOKIE)).add(session), Redirect::to(&next)).into_response()
         }
         Ok(None) => {
             eprintln!("명단에 없는 로그인 시도: {email}");
@@ -229,8 +251,13 @@ pub async fn callback(
 
 /// 로그인한 활성 직원을 돌려준다. 아니면 그대로 돌려줄 응답(로그인 이동 등)을 에러로 준다.
 pub fn current_user(app: &AppState, jar: &PrivateCookieJar) -> Result<User, Response> {
+    current_user_next(app, jar, "/")
+}
+
+/// `current_user` 와 같고, 로그인이 필요하면 로그인 뒤 `next` 로 돌아오게 보낸다.
+pub fn current_user_next(app: &AppState, jar: &PrivateCookieJar, next: &str) -> Result<User, Response> {
     let Some(email) = session_email(jar) else {
-        return Err(Redirect::to("/login").into_response());
+        return Err(Redirect::to(&format!("/login?next={}", safe_next(next))).into_response());
     };
     // 로그인 뒤에 계정이 비활성화됐을 수 있으므로 매번 명단을 다시 본다.
     match app.users.find_active(&email) {
@@ -274,4 +301,17 @@ pub async fn terms() -> Html<String> {
          <p>업로드한 문서의 내용에 대한 책임은 올린 사람에게 있다. 고객 정보나 비밀값을 올리지 않는다.</p>\
          <p>운영자는 서비스 운영에 필요하면 문서를 숨기거나 계정을 비활성화할 수 있다.</p>",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_next;
+
+    #[test]
+    fn 돌아갈_곳은_문서_주소만_받는다() {
+        assert_eq!(safe_next("/d/abc-DEF_123"), "/d/abc-DEF_123");
+        for bad in ["", "/", "//evil.com", "https://evil.com", "/d/", "/d/a/b", "/d/../x", "/d/a?x=1", "/login", "/d//evil.com"] {
+            assert_eq!(safe_next(bad), "/", "{bad}");
+        }
+    }
 }

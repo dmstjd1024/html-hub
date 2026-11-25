@@ -1,6 +1,6 @@
 use crate::{
     AppState,
-    auth::{current_user, escape, page},
+    auth::{current_user, current_user_next, escape, page},
 };
 use anyhow::Result;
 use axum::{
@@ -355,7 +355,7 @@ pub async fn uploaded(State(app): State<AppState>, jar: PrivateCookieJar, Path(i
 }
 
 pub async fn view(State(app): State<AppState>, jar: PrivateCookieJar, Path(id): Path<String>) -> Response {
-    if let Err(r) = current_user(&app, &jar) {
+    if let Err(r) = current_user_next(&app, &jar, &format!("/d/{id}")) {
         return r;
     }
     match app.docs.get(&id) {
