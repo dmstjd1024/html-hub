@@ -703,6 +703,9 @@ pub async fn index(
     jar: PrivateCookieJar,
     Query(query): Query<ListQuery>,
 ) -> Response {
+    if let Some(r) = crate::auth::landing(&jar) {
+        return r;
+    }
     let user = match current_user(&app, &jar) {
         Ok(u) => u,
         Err(r) => return r,

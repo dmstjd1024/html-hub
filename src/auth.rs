@@ -237,6 +237,10 @@ td.t{width:40%;max-width:0}
 .panel{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin-bottom:16px}
 .sheet{max-width:640px;margin:12vh auto;padding:28px 32px 32px;background:var(--surface);border:1px solid var(--line);border-radius:10px;font-size:16px}
 .sheet .brand{display:inline-block;color:var(--leaf-ink);margin-bottom:16px}
+.landing h1{font-size:26px;margin-bottom:10px}
+.landing .btn{margin-top:12px}
+.landing .foot{font-size:13px;color:var(--ink-3);margin:28px 0 0;padding-top:16px;border-top:1px solid var(--line-2)}
+.landing .foot a{color:var(--ink-2)}
 .form{max-width:560px}
 .copy{display:flex;gap:8px;margin:16px 0;max-width:760px}
 .narrow{max-width:760px}
@@ -327,6 +331,8 @@ pre{background:var(--tag);border-radius:6px;padding:12px 14px;overflow-x:auto;fo
 .rowmenu a,.rowmenu button{display:flex;align-items:center;min-height:44px;padding:0 12px;color:var(--ink);text-decoration:none;font:inherit;font-size:14px;background:none;border:0;cursor:pointer;text-align:left;width:100%}
 .rowmenu .danger{color:var(--alert)}
 .side{grid-template-columns:1fr}
+.sheet{margin:0;min-height:100vh;border:0;border-radius:0;padding:32px 20px}
+.landing .btn{display:block;text-align:center}
 }
 "#;
 
@@ -345,6 +351,26 @@ fn document(body: &str) -> Html<String> {
 /// 로그인 없이 보이거나 혼자 떠 있는 안내 화면 (오류, 로그아웃, 약관).
 pub(crate) fn page(body: &str) -> Html<String> {
     document(&format!("<main class=\"sheet\"><h1 class=\"visually-hidden\">html-hub 안내</h1><a class=\"brand\" href=\"/\">html-hub</a><div>{body}</div></main>"))
+}
+
+/// 로그인 전 첫 화면. 구글로 바로 넘기지 않고 무슨 서비스인지와 로그인 버튼을 먼저 보여 준다.
+/// 세션이 있으면 None 이라 호출한 쪽이 평소 화면을 그린다.
+pub(crate) fn landing(jar: &PrivateCookieJar) -> Option<Response> {
+    if session_email(jar).is_some() {
+        return None;
+    }
+    Some(
+        document(
+            "<main class=\"sheet landing\"><span class=\"brand\">html-hub</span>\
+             <h1>사내 HTML 문서 공유</h1>\
+             <p class=\"lede\">보고서·대시보드처럼 HTML 로 만든 문서를 올리고 링크 하나로 동료와 나눕니다. \
+             댓글과 고친 기록도 함께 남습니다.</p>\
+             <p><a class=\"btn\" href=\"/login\">Google 계정으로 로그인</a></p>\
+             <p class=\"quiet\">회사 Google 계정으로 로그인하세요. 등록된 직원만 들어올 수 있습니다.</p>\
+             <p class=\"foot\"><a href=\"/privacy\">개인정보 처리방침</a><span class=\"sep\">·</span><a href=\"/terms\">서비스 약관</a></p></main>",
+        )
+        .into_response(),
+    )
 }
 
 /// 로그인한 직원이 보는 화면. 왼쪽 메뉴 띠(휴대폰에서는 위쪽 줄)에 현재 위치와 문서 수를 표시한다.

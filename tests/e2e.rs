@@ -234,7 +234,11 @@ async fn 공개_화면은_healthz_privacy_terms_login_뿐이다() {
     assert_eq!(s.get("/healthz", None).await.body, "ok");
     assert_eq!(s.get("/privacy", None).await.status, StatusCode::OK);
     assert_eq!(s.get("/terms", None).await.status, StatusCode::OK);
-    for path in ["/", "/upload", "/tokens", "/admin/hidden", "/admin/tokens"] {
+    // 첫 화면은 구글로 바로 넘기지 않고 로그인 버튼이 있는 안내를 보여 준다.
+    let r = s.get("/", None).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(r.body.contains("href=\"/login\"") && r.body.contains("Google 계정으로 로그인"), "{}", r.body);
+    for path in ["/upload", "/tokens", "/admin/hidden", "/admin/tokens"] {
         let r = s.get(path, None).await;
         assert_eq!(r.status, StatusCode::SEE_OTHER, "{path} 는 로그인이 필요하다");
         assert!(r.location().starts_with("/login"), "{path}: {}", r.location());
@@ -259,8 +263,9 @@ async fn 명단에_없거나_비활성인_계정은_들어오지_못한다() {
         assert_eq!(r.location(), "/login");
     }
     // 위조한 쿠키(다른 키)는 로그인으로 취급하지 않는다.
-    let r = s.get("/", Some("session=forged-value")).await;
+    let r = s.get("/upload", Some("session=forged-value")).await;
     assert!(r.location().starts_with("/login"));
+    assert!(s.get("/", Some("session=forged-value")).await.body.contains("Google 계정으로 로그인"));
     assert_eq!(s.get("/", Some(&s.login(OWNER))).await.status, StatusCode::OK);
 }
 
@@ -588,7 +593,7 @@ async fn r2_토큰으로_올리기() {
 
     // 토큰은 올리기 전용이다. 쿠키 없이 토큰만으로는 목록에 못 들어간다.
     let r = s.send(s.http.get(format!("{}/", s.base)).header(header::AUTHORIZATION, format!("Bearer {t1}")), None).await;
-    assert!(r.location().starts_with("/login"));
+    assert!(r.body.contains("Google 계정으로 로그인") && !r.body.contains("class=\"doc-title\""), "{}", r.body);
 
     // 서버에는 해시만 저장한다.
     let stored: String = s.db().query_row("SELECT hash FROM api_tokens LIMIT 1", [], |r| r.get(0)).unwrap();
