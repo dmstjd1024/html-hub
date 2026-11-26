@@ -516,7 +516,7 @@ pub async fn index(
          <table><tr><th>제목</th><th>프로젝트</th><th>올린 사람</th><th>올린 시각</th><th></th></tr>{rows}</table>{empty}{nav}",
         escape(&user.name),
         escape(&q),
-        admin = if user.is_admin() { "<a href=\"/admin/hidden\">숨긴 문서</a> " } else { "" },
+        admin = if user.is_admin() { "<a href=\"/admin/hidden\">숨긴 문서</a> <a href=\"/admin/tokens\">토큰 관리</a> " } else { "" },
     ))
     .into_response()
 }

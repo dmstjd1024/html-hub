@@ -74,6 +74,8 @@ async fn main() -> Result<()> {
         .route("/terms", get(auth::terms))
         .route("/tokens", get(tokens::tokens_page).post(tokens::tokens_issue))
         .route("/tokens/revoke", post(tokens::tokens_revoke))
+        .route("/admin/tokens", get(tokens::admin_tokens))
+        .route("/admin/tokens/revoke", post(tokens::admin_tokens_revoke))
         .route(
             "/api/upload",
             post(tokens::api_upload).layer(DefaultBodyLimit::max(docs::MAX_BYTES + 64 * 1024)),

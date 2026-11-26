@@ -111,6 +111,16 @@ impl Tokens {
             )
             .optional()?)
     }
+
+    /// 폐기되지 않은 토큰 전부를 최근 발급순으로 (관리자 화면용, 정책서 T5 의 위험 대응).
+    pub fn active(&self) -> Result<Vec<(String, TokenInfo)>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT email, created_at, last_used_at FROM api_tokens WHERE revoked_at IS NULL ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, TokenInfo { created_at: r.get(1)?, last_used_at: r.get(2)? })))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
 }
 
 fn show_time(unix: i64) -> String {
@@ -178,6 +188,73 @@ pub async fn tokens_revoke(State(app): State<AppState>, jar: PrivateCookieJar) -
     };
     match app.tokens.revoke(&user.email) {
         Ok(()) => Redirect::to("/tokens").into_response(),
+        Err(e) => {
+            eprintln!("토큰 폐기 실패: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+fn admin_only() -> Response {
+    (StatusCode::FORBIDDEN, page("관리자만 할 수 있습니다. <a href=\"/\">목록으로</a>")).into_response()
+}
+
+/// 직원들의 활성 토큰 목록과 강제 폐기 (정책서 T5: 토큰이 새면 관리자가 막는다).
+pub async fn admin_tokens(State(app): State<AppState>, jar: PrivateCookieJar) -> Response {
+    match current_user(&app, &jar) {
+        Ok(u) if u.is_admin() => {}
+        Ok(_) => return admin_only(),
+        Err(r) => return r,
+    }
+    let list = match app.tokens.active() {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("토큰 목록 조회 실패: {e}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let rows: String = list
+        .iter()
+        .map(|(email, i)| {
+            format!(
+                "<tr><td>{email}</td><td>{}</td><td>{}</td><td>\
+                 <form method=\"post\" action=\"/admin/tokens/revoke\" style=\"display:inline\">\
+                 <input type=\"hidden\" name=\"email\" value=\"{email}\"><button>폐기</button></form></td></tr>",
+                show_time(i.created_at),
+                i.last_used_at.map_or("없음".into(), show_time),
+                email = escape(email),
+            )
+        })
+        .collect();
+    let empty = if list.is_empty() { "<p>발급된 토큰이 없습니다.</p>" } else { "" };
+    page(&format!(
+        "<h1>토큰 관리</h1><p>폐기하면 그 토큰으로는 더 올릴 수 없습니다. 직원은 /tokens 에서 새로 발급받을 수 있습니다.</p>\
+         <table><tr><th>직원</th><th>발급</th><th>마지막 사용</th><th></th></tr>{rows}</table>{empty}\
+         <p><a href=\"/\">목록으로</a></p>"
+    ))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct RevokeForm {
+    email: String,
+}
+
+pub async fn admin_tokens_revoke(
+    State(app): State<AppState>,
+    jar: PrivateCookieJar,
+    axum::Form(form): axum::Form<RevokeForm>,
+) -> Response {
+    let admin = match current_user(&app, &jar) {
+        Ok(u) if u.is_admin() => u,
+        Ok(_) => return admin_only(),
+        Err(r) => return r,
+    };
+    match app.tokens.revoke(&form.email) {
+        Ok(()) => {
+            eprintln!("관리자 토큰 폐기: {} 가 {} 의 토큰을 폐기", admin.email, form.email);
+            Redirect::to("/admin/tokens").into_response()
+        }
         Err(e) => {
             eprintln!("토큰 폐기 실패: {e}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -256,6 +333,20 @@ mod tests {
         let (a, b) = (t.issue("a@x.im").unwrap(), t.issue("b@x.im").unwrap());
         assert_eq!(t.owner(&a).unwrap().as_deref(), Some("a@x.im"));
         assert_eq!(t.owner(&b).unwrap().as_deref(), Some("b@x.im"));
+    }
+
+    #[test]
+    fn 활성_토큰만_최근_발급순으로_보이고_폐기하면_빠진다() {
+        let t = Tokens::open(":memory:").unwrap();
+        t.issue("a@x.im").unwrap();
+        t.issue("a@x.im").unwrap();
+        let b = t.issue("b@x.im").unwrap();
+        t.0.lock().unwrap().execute("UPDATE api_tokens SET created_at = created_at + 10 WHERE email = 'b@x.im'", []).unwrap();
+        let emails: Vec<String> = t.active().unwrap().into_iter().map(|(e, _)| e).collect();
+        assert_eq!(emails, ["b@x.im", "a@x.im"], "재발급으로 폐기된 것은 빠진다");
+        t.revoke("b@x.im").unwrap();
+        assert_eq!(t.owner(&b).unwrap(), None);
+        assert_eq!(t.active().unwrap().len(), 1);
     }
 
     #[test]
