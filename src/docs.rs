@@ -336,6 +336,21 @@ impl Docs {
         Ok(n > 0)
     }
 
+    /// 본문(현재 버전)에서 검색어가 처음 나오는 곳 앞 40자부터 120자. 본문에 없으면 None.
+    pub fn excerpt(&self, id: &str, q: &str) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT substr(text, max(instr(lower(text), lower(?2)) - 40, 1), 120)
+                 FROM bodies WHERE doc_id = ?1 AND instr(lower(text), lower(?2)) > 0",
+                params![id, q],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn record_view(&self, id: &str) -> Result<()> {
         self.db
             .lock()
@@ -494,8 +509,16 @@ pub async fn index(
             } else {
                 String::new()
             };
+            // 본문에서 걸렸으면 왜 걸렸는지 보이게 주변 글자를 붙인다. 발췌를 못 읽어도 목록은 보여 준다.
+            let excerpt = match q.trim() {
+                "" => String::new(),
+                t => match app.docs.excerpt(&d.id, t) {
+                    Ok(Some(e)) => format!("<br><small style=\"color:#666\">…{}…</small>", escape(&e)),
+                    _ => String::new(),
+                },
+            };
             format!(
-                "<tr><td><a href=\"/d/{id}\">{}</a></td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"/d/{id}/history\">이력</a> <a href=\"/d/{id}/comments\">댓글</a> {delete}</td></tr>",
+                "<tr><td><a href=\"/d/{id}\">{}</a>{excerpt}</td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"/d/{id}/history\">이력</a> <a href=\"/d/{id}/comments\">댓글</a> {delete}</td></tr>",
                 escape(&d.title),
                 if d.project.is_empty() { "미분류".into() } else { escape(&d.project) },
                 escape(&d.uploader_name),
@@ -1178,6 +1201,21 @@ mod tests {
         assert_eq!(d.list("본문글", "", 0).unwrap().len(), 1, "본문 검색에도 다시 걸린다");
         assert!(!d.unhide(&id).unwrap(), "숨기지 않은 문서는 바뀌지 않는다");
         assert!(!d.unhide("없는번호").unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn 본문에서_찾은_검색어_주변을_발췌한다() {
+        let (d, dir) = docs();
+        let a = user("a@x.im", "가나");
+        let long = format!("<p>{}분기 매출 요약{}</p>", "앞".repeat(100), "뒤".repeat(100));
+        let id = d.insert("보고", "", &a, long.as_bytes()).unwrap();
+        let e = d.excerpt(&id, "매출").unwrap().unwrap();
+        assert!(e.contains("분기 매출 요약"));
+        assert!(e.chars().count() <= 120, "발췌는 짧게");
+        let start = d.insert("짧은", "", &a, "<p>Revenue 맨 앞</p>".as_bytes()).unwrap();
+        assert!(d.excerpt(&start, "revenue").unwrap().unwrap().starts_with("Revenue"), "대소문자 무시, 맨 앞 일치");
+        assert_eq!(d.excerpt(&id, "없는말").unwrap(), None);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
