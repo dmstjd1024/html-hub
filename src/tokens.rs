@@ -150,13 +150,14 @@ pub async fn tokens_page(State(app): State<AppState>, jar: PrivateCookieJar) -> 
             i.last_used_at.map_or("없음".into(), show_time)
         ),
         None => "<section class=\"panel\"><h2>발급된 토큰이 없습니다</h2>\
-                 <p class=\"quiet\">발급하면 Claude 나 터미널에서 이 사이트로 바로 올릴 수 있습니다.</p></section>".into(),
+                 <p class=\"quiet\">발급하면 Claude나 터미널에서 이 사이트로 바로 올릴 수 있습니다.</p></section>".into(),
     };
     shell(
+        &app,
         &user,
         "/tokens",
         &format!(
-            "<div class=\"top\"><div><h1>내 토큰</h1>\
+            "<div class=\"head\"><div><h1>내 토큰</h1>\
              <p class=\"lede\">도구가 문서를 올릴 때 쓰는 열쇠입니다. 이 토큰으로 올린 문서는 {} 님이 올린 것으로 기록되니 남에게 알려 주지 마세요.</p></div></div>\
              <div class=\"form\">{state}\
              <form method=\"post\" action=\"/tokens\"><button class=\"btn\">새 토큰 발급</button></form>\
@@ -174,10 +175,11 @@ pub async fn tokens_issue(State(app): State<AppState>, jar: PrivateCookieJar) ->
     };
     match app.tokens.issue(&user.email) {
         Ok(token) => shell(
+            &app,
             &user,
             "/tokens",
             &format!(
-                "<div class=\"top\"><div><h1>새 토큰</h1>\
+                "<div class=\"head\"><div><h1>새 토큰</h1>\
                  <p class=\"lede\">이 화면을 벗어나면 다시 볼 수 없습니다. 지금 복사해 두세요.</p></div></div>\
                  <pre style=\"user-select:all\">{token}</pre>\
                  <h2 style=\"margin-top:24px\">터미널에서 올리기</h2>\
@@ -248,10 +250,11 @@ pub async fn admin_tokens(State(app): State<AppState>, jar: PrivateCookieJar) ->
         )
     };
     shell(
+        &app,
         &user,
         "/admin/tokens",
         &format!(
-            "<div class=\"top\"><div><h1>토큰 관리</h1>\
+            "<div class=\"head\"><div><h1>토큰 관리</h1>\
              <p class=\"lede\">토큰이 새었다면 여기서 폐기하세요. 폐기한 토큰으로는 더 올릴 수 없고, 직원은 내 토큰에서 새로 발급받을 수 있습니다.</p></div></div>{body}"
         ),
     )

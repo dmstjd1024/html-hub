@@ -388,7 +388,7 @@ async fn r1_3_목록은_최신순이고_제목_올린사람_본문으로_찾는�
 
     let r = s.get("/", Some(&owner)).await;
     assert_eq!(listed_titles(&r.body), ["설계 메모", "월간 보고"], "최신순");
-    for col in ["<span class=\"tag\">A</span>", "<span class=\"tag\">B</span>", "<td>김올림</td>", "<td>이다른</td>"] {
+    for col in ["<span class=\"tag\">A</span>", "<span class=\"tag\">B</span>", "class=\"by\">김올림<time", "class=\"by\">이다른<time"] {
         assert!(r.body.contains(col), "목록에 {col}");
     }
 
@@ -419,8 +419,13 @@ async fn r1_4_프로젝트를_고르면_그_프로젝트만_보인다() {
 
     let r = s.get("/?project=A", Some(&me)).await;
     assert_eq!(listed_titles(&r.body), ["가"]);
-    assert!(r.body.contains("aria-current=\"true\">A</a>") && r.body.contains("project=B\">B</a>"), "프로젝트 칩");
-    assert!(s.get("/", Some(&me)).await.body.contains("<span class=\"tag none\">미분류</span>"));
+    assert!(r.body.contains("aria-current=\"true\">A<span class=\"n\">1</span></a>"), "고른 칩과 문서 수");
+    assert!(r.body.contains("href=\"/?project=B\">B<span class=\"n\">1</span></a>"));
+    let all = s.get("/", Some(&me)).await.body;
+    assert!(all.contains("<span class=\"tag none\">미분류</span>"));
+    assert!(all.contains("href=\"/?unfiled=1\">미분류<span class=\"n\">1</span></a>"), "미분류 칩");
+    assert!(all.contains("aria-current=\"true\">모든 프로젝트<span class=\"n\">3</span></a>"));
+    assert_eq!(listed_titles(&s.get("/?unfiled=1", Some(&me)).await.body), ["다"], "미분류만");
 
     // 올리기 화면은 기존 프로젝트를 제안한다.
     let up = s.get("/upload", Some(&me)).await.body;
@@ -556,7 +561,7 @@ async fn r2_토큰으로_올리기() {
     let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
     let id = v["id"].as_str().unwrap();
     assert_eq!(v["url"], format!("{}/d/{id}", s.base));
-    assert!(s.get("/", Some(&other)).await.body.contains("<td>김올림</td>"), "토큰 주인 이름으로 기록");
+    assert!(s.get("/", Some(&other)).await.body.contains("class=\"by\">김올림<time"), "토큰 주인 이름으로 기록");
 
     assert_eq!(api(None, "x", "a.html").await.status, StatusCode::UNAUTHORIZED);
     assert_eq!(api(Some("hh_wrong".into()), "x", "a.html").await.status, StatusCode::UNAUTHORIZED);
@@ -673,33 +678,54 @@ async fn 대시보드는_요약_숫자와_많이_본_문서와_최근_댓글을_
     s.post(&format!("/d/{cold}/comments"), Some(&owner), &[("body", "확인했습니다")]).await;
 
     let r = s.get("/", Some(&owner)).await.body;
-    let figure = |label: &str| {
+    // 요약 숫자 (앞의 숫자만 본다. 열람된 문서는 "/ 전체" 가 붙는다).
+    let figure = |label: &str| -> String {
         let after = r.split_once(&format!("<dt>{label}</dt><dd>")).unwrap().1;
-        after.split_once("</dd>").unwrap().0.to_owned()
+        after.chars().take_while(|c| c.is_ascii_digit()).collect()
     };
-    assert_eq!((figure("전체 문서"), figure("최근 7일 열람된 문서"), figure("내가 올린 문서")), ("2".into(), "2".into(), "1".into()));
+    assert_eq!(
+        (figure("전체 문서"), figure("<span class=\"long\">최근 </span>7일 열람된 문서"), figure("내가 올린 문서")),
+        ("2".into(), "2".into(), "1".into())
+    );
+    assert!(r.contains("<small> / 2</small>") && r.contains("열람 4회") && r.contains("프로젝트 2개"));
+    assert_eq!(r.matches("<span class=\"on").count(), 1, "오늘 칸에만 하루별 막대");
+    assert!(r.contains("<span class=\"on today\" style=\"height:100%\""));
 
-    let panel = r.split_once("<h2>많이 본 문서</h2>").unwrap().1;
+    let panel = r.split_once("많이 본 문서<small>최근 7일</small></h2>").unwrap().1;
     let (first, second) = (panel.find("자주 보는 보고서").unwrap(), panel.find("가끔 보는 메모").unwrap());
-    assert!(first < second && panel.contains("3번 열람"), "열람 많은 순");
-    let comments = r.split_once("<h2>최근 댓글</h2>").unwrap().1;
+    assert!(first < second && panel.contains("<span class=\"n\">3회</span>"), "열람 많은 순");
+    let comments = r.split_once("최근 댓글<small>전체 1개</small></h2>").unwrap().1;
     assert!(comments.contains(&format!("href=\"/d/{cold}/comments\">가끔 보는 메모</a>")) && comments.contains("확인했습니다"));
 
-    // 문서 줄마다 7일 열람 수와 댓글 수.
-    let row = r.split(&format!("href=\"/d/{hot}\">자주 보는 보고서</a>")).nth(1).unwrap().split("</tr>").next().unwrap();
-    assert!(row.contains("data-label=\"7일 열람\">3</td><td class=\"num\" data-label=\"댓글\">0</td>"), "{row}");
-    let row = r.split(&format!("href=\"/d/{cold}\">가끔 보는 메모</a>")).nth(1).unwrap().split("</tr>").next().unwrap();
-    assert!(row.contains("data-label=\"7일 열람\">1</td><td class=\"num\" data-label=\"댓글\">1</td>"), "{row}");
+    // 문서 줄마다 7일 열람 수(막대와 숫자)와 댓글 수.
+    let row = |id: &str| r.split(&format!("href=\"/d/{id}\" title=")).nth(1).unwrap().split("</tr>").next().unwrap().to_owned();
+    let (h, c) = (row(&hot), row(&cold));
+    assert!(h.contains("width:100%\"></i></span>3</td><td class=\"num c zero\" data-label=\"댓글\">0</td>"), "{h}");
+    assert!(c.contains("width:33%\"></i></span>1</td><td class=\"num c\" data-label=\"댓글\">1</td>"), "{c}");
+    // 휴대폰에서는 줄마다 접힌 작업 메뉴를 쓴다. 남의 문서에는 삭제가 없다.
+    assert!(h.contains("<details class=\"rowmenu\">") && h.contains("삭제…") && !c.contains("삭제…"));
+
+    // 내 문서만 보기, 정렬.
+    assert!(r.contains("href=\"/?mine=1\">내 문서만 보기</a>"));
+    let mine = s.get("/?mine=1", Some(&owner)).await.body;
+    assert_eq!(listed_titles(&mine), ["자주 보는 보고서"]);
+    assert!(mine.contains("모든 문서 보기") && mine.contains("모든 프로젝트, 내 문서"));
+    assert_eq!(listed_titles(&s.get("/?sort=views", Some(&owner)).await.body), ["자주 보는 보고서", "가끔 보는 메모"]);
+    assert_eq!(listed_titles(&s.get("/?sort=comments", Some(&owner)).await.body), ["가끔 보는 메모", "자주 보는 보고서"]);
+    let by_title = s.get("/?sort=title", Some(&owner)).await.body;
+    assert_eq!(listed_titles(&by_title), ["가끔 보는 메모", "자주 보는 보고서"]);
+    assert!(by_title.contains("<option value=\"title\" selected>제목 순</option>") && by_title.contains("<th>제목 ↑</th>"));
 
     // 숨긴 문서는 숫자와 패널에서 빠진다.
     s.post(&format!("/d/{hot}/delete"), Some(&owner), &[]).await;
     let r = s.get("/", Some(&owner)).await.body;
     assert!(r.contains("<dt>전체 문서</dt><dd>1</dd>") && !r.contains("자주 보는 보고서"));
 
-    // 메뉴 띠는 지금 화면을 표시하고, 관리 메뉴는 관리자에게만 보인다.
-    assert!(r.contains("<a href=\"/\" aria-current=\"page\">문서</a>"));
+    // 메뉴 띠는 지금 화면과 문서 수를 표시하고, 관리 메뉴(숨긴 문서 수)는 관리자에게만 보인다.
+    assert!(r.contains("<a href=\"/\" aria-current=\"page\">문서<span class=\"count\">1</span></a>"));
     assert!(s.get("/upload", Some(&owner)).await.body.contains("<a href=\"/upload\" aria-current=\"page\">올리기</a>"));
-    assert!(!r.contains("토큰 관리") && s.get("/", Some(&s.login(ADMIN))).await.body.contains("토큰 관리"));
+    let admin = s.get("/", Some(&s.login(ADMIN))).await.body;
+    assert!(!r.contains("토큰 관리") && admin.contains("토큰 관리") && admin.contains("숨긴 문서<span class=\"count\">1</span>"));
 }
 
 #[tokio::test]

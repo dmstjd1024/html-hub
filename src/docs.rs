@@ -39,6 +39,52 @@ pub struct RecentComment {
     pub created_at: i64,
 }
 
+/// 보이는 문서 수, 지난 7일 열람된 문서 수(북극성 지표), 이 사람이 올린 문서 수, 숨긴 문서 수, 보이는 댓글 수.
+#[derive(Default)]
+pub struct Summary {
+    pub total: i64,
+    pub viewed: i64,
+    pub mine: i64,
+    pub hidden: i64,
+    pub comments: i64,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Sort {
+    Recent,
+    Views,
+    Comments,
+    Title,
+}
+
+impl Sort {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "views" => Sort::Views,
+            "comments" => Sort::Comments,
+            "title" => Sort::Title,
+            _ => Sort::Recent,
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Sort::Recent => "recent",
+            Sort::Views => "views",
+            Sort::Comments => "comments",
+            Sort::Title => "title",
+        }
+    }
+}
+
+/// 목록 조건. `project` 가 None 이면 모든 프로젝트, Some("") 이면 미분류만. `uploader` 가 비면 모든 사람.
+pub struct Filter<'a> {
+    pub q: &'a str,
+    pub project: Option<&'a str>,
+    pub uploader: &'a str,
+    pub sort: Sort,
+}
+
 /// 대시보드의 "지난 7일" 기준.
 const WEEK: i64 = 7 * 86400;
 
@@ -293,20 +339,59 @@ impl Docs {
     /// LIKE 대신 instr 를 써서 검색어의 % 나 _ 가 특수문자로 해석되지 않게 한다.
     /// shortcut: 본문을 전부 훑는다. 문서가 수천 건을 넘어 느려지면 FTS5(trigram)로 바꾼다.
     /// `offset` 부터 한 쪽(PAGE_SIZE)을 돌려주되, 다음 쪽이 있는지 알 수 있게 한 개 더 가져온다.
-    pub fn list(&self, q: &str, project: &str, offset: i64) -> Result<Vec<Doc>> {
+    pub fn list(&self, f: &Filter, offset: i64) -> Result<Vec<Doc>> {
+        // 정렬 기준은 정해진 목록에서만 고르므로 SQL 에 직접 넣어도 안전하다.
+        let order = match f.sort {
+            Sort::Recent => String::new(),
+            Sort::Views => format!(
+                "(SELECT COUNT(*) FROM views v WHERE v.doc_id = documents.id AND v.at >= {}) DESC,",
+                now_unix() - WEEK
+            ),
+            Sort::Comments => {
+                "(SELECT COUNT(*) FROM comments c WHERE c.doc_id = documents.id AND c.deleted_at IS NULL) DESC,".into()
+            }
+            Sort::Title => "title COLLATE NOCASE ASC,".into(),
+        };
         let conn = self.db.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT id, title, project, uploader_email, uploader_name, created_at
              FROM documents
              WHERE deleted_at IS NULL
                AND (?1 = '' OR instr(lower(title), lower(?1)) > 0 OR instr(lower(uploader_name), lower(?1)) > 0
                     OR EXISTS (SELECT 1 FROM bodies b WHERE b.doc_id = documents.id AND instr(lower(b.text), lower(?1)) > 0))
-               AND (?2 = '' OR project = ?2)
-             ORDER BY created_at DESC, rowid DESC
-             LIMIT ?3 OFFSET ?4",
-        )?;
-        let rows = stmt.query_map(params![q, project, PAGE_SIZE + 1, offset], row_to_doc)?;
+               AND (?2 IS NULL OR project = ?2)
+               AND (?3 = '' OR uploader_email = ?3)
+             ORDER BY {order} created_at DESC, rowid DESC
+             LIMIT ?4 OFFSET ?5"
+        ))?;
+        let rows = stmt.query_map(params![f.q, f.project, f.uploader, PAGE_SIZE + 1, offset], row_to_doc)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// 프로젝트별 보이는 문서 수. 미분류("")는 맨 뒤.
+    pub fn project_counts(&self) -> Result<Vec<(String, i64)>> {
+        let conn = self.db.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT project, COUNT(*) FROM documents WHERE deleted_at IS NULL
+             GROUP BY project ORDER BY project = '', project",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// 오늘을 포함한 최근 7일(한국 날짜)의 하루별 열람 수. (그날 0시의 유닉스 시각, 열람 수), 오래된 날부터.
+    pub fn daily_views(&self) -> Result<Vec<(i64, i64)>> {
+        const KST: i64 = 9 * 3600;
+        let today = (now_unix() + KST).div_euclid(86400);
+        let start = (today - 6) * 86400 - KST;
+        let conn = self.db.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT (v.at + 32400) / 86400, COUNT(*) FROM views v JOIN documents d ON d.id = v.doc_id
+             WHERE d.deleted_at IS NULL AND v.at >= ?1 GROUP BY 1",
+        )?;
+        let counts: std::collections::HashMap<i64, i64> =
+            stmt.query_map([start], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        Ok((today - 6..=today).map(|day| (day * 86400 - KST, counts.get(&day).copied().unwrap_or(0))).collect())
     }
 
     /// 삭제되지 않은 문서에 쓰인 프로젝트 이름들.
@@ -365,15 +450,18 @@ impl Docs {
             .optional()?)
     }
 
-    /// 보이는 문서 수, 지난 7일 열람된 문서 수(북극성 지표), 이 사람이 올린 문서 수.
-    pub fn summary(&self, email: &str) -> Result<(i64, i64, i64)> {
+    /// 대시보드와 메뉴에 쓰는 숫자들.
+    pub fn summary(&self, email: &str) -> Result<Summary> {
         Ok(self.db.lock().unwrap().query_row(
             "SELECT (SELECT COUNT(*) FROM documents WHERE deleted_at IS NULL),
                     (SELECT COUNT(DISTINCT v.doc_id) FROM views v JOIN documents d ON d.id = v.doc_id
                       WHERE d.deleted_at IS NULL AND v.at >= ?2),
-                    (SELECT COUNT(*) FROM documents WHERE deleted_at IS NULL AND uploader_email = ?1)",
+                    (SELECT COUNT(*) FROM documents WHERE deleted_at IS NULL AND uploader_email = ?1),
+                    (SELECT COUNT(*) FROM documents WHERE deleted_at IS NOT NULL),
+                    (SELECT COUNT(*) FROM comments c JOIN documents d ON d.id = c.doc_id
+                      WHERE c.deleted_at IS NULL AND d.deleted_at IS NULL)",
             params![email, now_unix() - WEEK],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok(Summary { total: r.get(0)?, viewed: r.get(1)?, mine: r.get(2)?, hidden: r.get(3)?, comments: r.get(4)? }),
         )?)
     }
 
@@ -492,23 +580,26 @@ pub fn show_time(unix: i64) -> String {
     format!("{} {:02}:{:02}", t.date(), t.hour(), t.minute())
 }
 
-/// "3시간 전" 처럼 읽기 쉬운 시각. 일주일이 넘으면 날짜로 보인다 (한국 시각).
+/// 오늘은 "3시간 전", 어제는 "어제", 그 전은 날짜로 보인다 (한국 시각). 상대 시각만 쓰면 하루만 지나도 구분이 안 된다.
 fn relative(unix: i64, now: i64) -> String {
+    let kst = UtcOffset::from_hms(9, 0, 0).unwrap();
+    let (Ok(t), Ok(n)) = (OffsetDateTime::from_unix_timestamp(unix), OffsetDateTime::from_unix_timestamp(now)) else {
+        return String::new();
+    };
+    let (t, n) = (t.to_offset(kst), n.to_offset(kst));
     let d = (now - unix).max(0);
-    match d {
-        0..60 => "방금".into(),
-        60..3600 => format!("{}분 전", d / 60),
-        3600..86400 => format!("{}시간 전", d / 3600),
-        86400..WEEK => format!("{}일 전", d / 86400),
-        _ => {
-            let kst = UtcOffset::from_hms(9, 0, 0).unwrap();
-            let (Ok(t), Ok(n)) = (OffsetDateTime::from_unix_timestamp(unix), OffsetDateTime::from_unix_timestamp(now)) else {
-                return String::new();
-            };
-            let (t, n) = (t.to_offset(kst), n.to_offset(kst));
-            let md = format!("{}월 {}일", u8::from(t.month()), t.day());
-            if t.year() == n.year() { md } else { format!("{}년 {md}", t.year()) }
-        }
+    if d < 60 {
+        "방금".into()
+    } else if d < 3600 {
+        format!("{}분 전", d / 60)
+    } else if t.date() >= n.date() {
+        format!("{}시간 전", d / 3600)
+    } else if n.date().previous_day() == Some(t.date()) {
+        "어제".into()
+    } else if t.year() == n.year() {
+        format!("{}월 {}일", u8::from(t.month()), t.day())
+    } else {
+        format!("{}년 {}월 {}일", t.year(), u8::from(t.month()), t.day())
     }
 }
 
@@ -550,7 +641,37 @@ fn server_error(what: &str, e: impl std::fmt::Display) -> Response {
 pub struct ListQuery {
     q: Option<String>,
     project: Option<String>,
+    unfiled: Option<String>,
+    mine: Option<String>,
+    sort: Option<String>,
     page: Option<i64>,
+}
+
+/// 목록 주소. 검색어는 유지하고 쪽은 처음으로 돌린다. `project` 가 Some("") 이면 미분류.
+fn list_url(q: &str, project: Option<&str>, mine: bool, sort: Sort) -> String {
+    let enc = |s: &str| -> String { openidconnect::url::form_urlencoded::byte_serialize(s.as_bytes()).collect() };
+    let mut p = Vec::new();
+    if !q.is_empty() {
+        p.push(format!("q={}", enc(q)));
+    }
+    match project {
+        Some("") => p.push("unfiled=1".into()),
+        Some(name) => p.push(format!("project={}", enc(name))),
+        None => {}
+    }
+    if mine {
+        p.push("mine=1".into());
+    }
+    if sort != Sort::Recent {
+        p.push(format!("sort={}", sort.key()));
+    }
+    if p.is_empty() { "/".into() } else { format!("/?{}", p.join("&")) }
+}
+
+/// 비율 막대. 값이 있으면 너무 짧아 안 보이지 않게 최소 폭을 둔다.
+fn meter(n: i64, max: i64) -> String {
+    let pct = if max > 0 && n > 0 { (n * 100 / max).max(8) } else { 0 };
+    format!("<span class=\"meter\" aria-hidden=\"true\"><i style=\"width:{pct}%\"></i></span>")
 }
 
 pub async fn index(
@@ -562,24 +683,114 @@ pub async fn index(
         Ok(u) => u,
         Err(r) => return r,
     };
-    let q = query.q.unwrap_or_default();
-    let project = query.project.unwrap_or_default();
+    let q = query.q.unwrap_or_default().trim().to_owned();
+    let project_name = query.project.unwrap_or_default();
+    let project: Option<&str> = if query.unfiled.as_deref() == Some("1") {
+        Some("")
+    } else if project_name.is_empty() {
+        None
+    } else {
+        Some(&project_name)
+    };
+    let mine = query.mine.as_deref() == Some("1");
+    let sort = Sort::parse(query.sort.as_deref().unwrap_or(""));
     // 큰 수를 넣어도 곱셈이 넘치지 않게 상한을 둔다.
     let page_no = query.page.unwrap_or(1).clamp(1, 1_000_000);
-    let (mut docs, projects) = match (app.docs.list(q.trim(), &project, (page_no - 1) * PAGE_SIZE), app.docs.projects()) {
-        (Ok(d), Ok(p)) => (d, p),
-        (Err(e), _) | (_, Err(e)) => return server_error("목록 조회", e),
+    let filter = Filter { q: &q, project, uploader: if mine { &user.email } else { "" }, sort };
+    let mut docs = match app.docs.list(&filter, (page_no - 1) * PAGE_SIZE) {
+        Ok(d) => d,
+        Err(e) => return server_error("목록 조회", e),
     };
     let has_next = docs.len() as i64 > PAGE_SIZE;
     docs.truncate(PAGE_SIZE as usize);
-    // 검색어·프로젝트를 숨은 칸으로 넘겨 브라우저가 주소를 인코딩하게 한다.
+    // 숫자·막대·옆 패널은 보조 정보라, 못 읽어도 목록은 보여 준다.
+    let sum = app.docs.summary(&user.email).unwrap_or_default();
+    let counts = app.docs.project_counts().unwrap_or_default();
+    let daily = app.docs.daily_views().unwrap_or_default();
+    let ids: Vec<String> = docs.iter().map(|d| d.id.clone()).collect();
+    let activity = app.docs.activity(&ids).unwrap_or_default();
+
+    // 요약: 전체 문서, 최근 7일 열람(하루별 막대), 내가 올린 문서.
+    let named = counts.iter().filter(|(p, _)| !p.is_empty()).count();
+    let unfiled_n = counts.iter().find(|(p, _)| p.is_empty()).map_or(0, |c| c.1);
+    let unfiled_note = if unfiled_n > 0 { format!(", 미분류 {unfiled_n}") } else { String::new() };
+    let day_max = daily.iter().map(|d| d.1).max().unwrap_or(0);
+    let week_views: i64 = daily.iter().map(|d| d.1).sum();
+    let bars: String = daily
+        .iter()
+        .enumerate()
+        .map(|(i, (start, n))| {
+            let h = if day_max > 0 { (n * 100 / day_max).max(if *n > 0 { 12 } else { 0 }) } else { 0 };
+            let class = match (*n > 0, i == daily.len() - 1) {
+                (true, true) => "on today",
+                (true, false) => "on",
+                _ => "",
+            };
+            format!("<span class=\"{class}\" style=\"height:{h}%\" title=\"{} {n}회\"></span>", show_time(*start).split(' ').next().unwrap_or(""))
+        })
+        .collect();
+    let first_day = daily.first().map(|(s, _)| show_time(*s)).unwrap_or_default();
+    let first_day = first_day.get(8..10).map(|d| format!("{}일", d.trim_start_matches('0'))).unwrap_or_default();
+    let mine_link = if mine {
+        format!("<a href=\"{}\">모든 문서 보기</a>", escape(&list_url(&q, project, false, sort)))
+    } else {
+        format!("<a href=\"{}\">내 문서만 보기</a>", escape(&list_url(&q, project, true, sort)))
+    };
+    let stats = format!(
+        "<dl class=\"stats\">\
+         <div><dt>전체 문서</dt><dd>{total}</dd><span class=\"sub\"><span>프로젝트 {named}개{unfiled_note}</span></span></div>\
+         <div class=\"with-spark\"><div><dt><span class=\"long\">최근 </span>7일 열람된 문서</dt><dd>{viewed}<small> / {total}</small></dd>\
+         <span class=\"sub\"><span>열람 {week_views}회</span></span></div>\
+         <div><div class=\"spark\" role=\"img\" aria-label=\"최근 7일 하루별 열람 수\">{bars}</div>\
+         <div class=\"spark-axis\"><span>{first_day}</span><span>오늘</span></div></div></div>\
+         <div><dt>내가 올린 문서</dt><dd>{mine_n}</dd><span class=\"sub\">{mine_link}</span></div></dl>",
+        total = sum.total,
+        viewed = sum.viewed,
+        mine_n = sum.mine,
+    );
+
+    // 프로젝트 칩: 문서 수를 붙이고, 미분류도 고를 수 있다.
+    let chip = |p: Option<&str>, label: &str, n: i64| {
+        let cur = if p == project { " aria-current=\"true\"" } else { "" };
+        format!(
+            "<a href=\"{}\"{cur}>{}<span class=\"n\">{n}</span></a>",
+            escape(&list_url(&q, p, mine, sort)),
+            escape(label)
+        )
+    };
+    let chips: String = std::iter::once(chip(None, "모든 프로젝트", sum.total))
+        .chain(counts.iter().map(|(p, n)| chip(Some(p), if p.is_empty() { "미분류" } else { p }, *n)))
+        .collect();
+    let hidden_keep = format!(
+        "<input type=\"hidden\" name=\"q\" value=\"{}\">{}{}",
+        escape(&q),
+        match project {
+            Some("") => "<input type=\"hidden\" name=\"unfiled\" value=\"1\">".to_owned(),
+            Some(p) => format!("<input type=\"hidden\" name=\"project\" value=\"{}\">", escape(p)),
+            None => String::new(),
+        },
+        if mine { "<input type=\"hidden\" name=\"mine\" value=\"1\">" } else { "" },
+    );
+    let sort_opts: String = [(Sort::Recent, "최근 올린 순"), (Sort::Views, "많이 본 순"), (Sort::Comments, "댓글 많은 순"), (Sort::Title, "제목 순")]
+        .iter()
+        .map(|(s, label)| {
+            let sel = if *s == sort { " selected" } else { "" };
+            format!("<option value=\"{}\"{sel}>{label}</option>", s.key())
+        })
+        .collect();
+    let toolbar = format!(
+        "<div class=\"toolbar\"><nav class=\"chips\" aria-label=\"프로젝트\">{chips}</nav>\
+         <form class=\"sort\" method=\"get\" action=\"/\">{hidden_keep}<label for=\"sort\">정렬</label>\
+         <select id=\"sort\" name=\"sort\" onchange=\"this.form.submit()\">{sort_opts}</select>\
+         <noscript><button class=\"btn quiet sm\">적용</button></noscript></form></div>"
+    );
+
+    // 검색어·프로젝트·정렬을 숨은 칸으로 넘겨 브라우저가 주소를 인코딩하게 한다.
     let nav_button = |n: i64, label: &str| {
         format!(
-            "<form method=\"get\" action=\"/\" style=\"display:inline\">\
-             <input type=\"hidden\" name=\"q\" value=\"{}\"><input type=\"hidden\" name=\"project\" value=\"{}\">\
-             <button name=\"page\" value=\"{n}\">{label}</button></form> ",
-            escape(&q),
-            escape(&project),
+            "<form method=\"get\" action=\"/\">{hidden_keep}<input type=\"hidden\" name=\"sort\" value=\"{}\">\
+             <button name=\"page\" value=\"{n}\">{label}</button></form>",
+            sort.key()
         )
     };
     let pager = if page_no > 1 || has_next {
@@ -592,134 +803,157 @@ pub async fn index(
         String::new()
     };
 
-    // 프로젝트 칩은 검색어를 유지한 채 프로젝트만 바꾸는 링크다.
-    let enc = |s: &str| -> String { openidconnect::url::form_urlencoded::byte_serialize(s.as_bytes()).collect() };
-    let chip = |p: &str, label: &str| {
-        let mut params = Vec::new();
-        if !q.trim().is_empty() {
-            params.push(format!("q={}", enc(q.trim())));
-        }
-        if !p.is_empty() {
-            params.push(format!("project={}", enc(p)));
-        }
-        let href = if params.is_empty() { "/".to_owned() } else { format!("/?{}", params.join("&")) };
-        let cur = if p == project { " aria-current=\"true\"" } else { "" };
-        format!("<a href=\"{}\"{cur}>{}</a>", escape(&href), escape(label))
-    };
-    let chips: String = std::iter::once(chip("", "모든 프로젝트"))
-        .chain(projects.iter().map(|p| chip(p, p)))
-        .collect();
-
-    let ids: Vec<String> = docs.iter().map(|d| d.id.clone()).collect();
-    // 열람·댓글 수와 옆 패널은 보조 정보라, 못 읽어도 목록은 보여 준다.
-    let activity = app.docs.activity(&ids).unwrap_or_default();
-    let (total, viewed, mine) = app.docs.summary(&user.email).unwrap_or_default();
+    let view_max = activity.values().map(|a| a.0).max().unwrap_or(0);
     let rows: String = docs
         .iter()
         .map(|d| {
             let id = escape(&d.id);
-            let delete = if can_modify(&user, d) {
-                format!(
-                    "<form method=\"post\" action=\"/d/{id}/delete\" \
-                     onsubmit=\"return confirm('이 문서를 목록에서 숨길까요? 관리자가 다시 살릴 수 있습니다.')\">\
-                     <button class=\"link danger\">삭제</button></form>"
+            let title = escape(&d.title);
+            let confirm = "onsubmit=\"return confirm('이 문서를 목록에서 숨길까요? 관리자가 다시 살릴 수 있습니다.')\"";
+            let (delete, delete_menu) = if can_modify(&user, d) {
+                (
+                    format!("<form method=\"post\" action=\"/d/{id}/delete\" {confirm}><button class=\"link danger\">삭제</button></form>"),
+                    format!("<form method=\"post\" action=\"/d/{id}/delete\" {confirm}><button class=\"danger\">삭제…</button></form>"),
                 )
             } else {
-                String::new()
+                // 삭제가 없는 줄도 작업 열 끝이 맞게 자리만 둔다.
+                ("<span class=\"slot\"></span>".to_owned(), String::new())
             };
             // 본문에서 걸렸으면 왜 걸렸는지 보이게 주변 글자를 붙인다. 발췌를 못 읽어도 목록은 보여 준다.
-            let excerpt = match q.trim() {
+            let excerpt = match q.as_str() {
                 "" => String::new(),
                 t => match app.docs.excerpt(&d.id, t) {
                     Ok(Some(e)) => format!("<span class=\"excerpt\">{}</span>", escape(&e)),
                     _ => String::new(),
                 },
             };
-            let project = if d.project.is_empty() {
+            let tag = if d.project.is_empty() {
                 "<span class=\"tag none\">미분류</span>".to_owned()
             } else {
                 format!("<span class=\"tag\">{}</span>", escape(&d.project))
             };
             let (views, comments) = activity.get(&d.id).copied().unwrap_or_default();
             format!(
-                "<tr><td><a class=\"doc-title\" href=\"/d/{id}\">{}</a>{excerpt}</td><td>{project}</td><td>{}</td>\
-                 <td class=\"when\">{}</td><td class=\"num\" data-label=\"7일 열람\">{views}</td><td class=\"num\" data-label=\"댓글\">{comments}</td>\
-                 <td class=\"actions\"><a href=\"/d/{id}/history\">이력</a><a href=\"/d/{id}/comments\">댓글</a>{delete}</td></tr>",
-                escape(&d.title),
+                "<tr><td class=\"t\"><a class=\"doc-title\" href=\"/d/{id}\" title=\"{title}\">{title}</a>{excerpt}</td>\
+                 <td class=\"g\">{tag}</td><td class=\"by\">{}{}</td>\
+                 <td class=\"num v{}\" data-label=\"7일 열람\">{}{views}</td><td class=\"num c{}\" data-label=\"댓글\">{comments}</td>\
+                 <td class=\"m\"><div class=\"acts\"><a href=\"/d/{id}/history\">이력</a><a href=\"/d/{id}/comments\">댓글</a>{delete}</div>\
+                 <details class=\"rowmenu\"><summary aria-label=\"{title} 작업\">···</summary>\
+                 <div><a href=\"/d/{id}/history\">이력 보기</a><a href=\"/d/{id}/comments\">댓글 보기</a>{delete_menu}</div></details></td></tr>",
                 escape(&d.uploader_name),
                 when(d.created_at),
+                if views == 0 { " zero" } else { "" },
+                meter(views, view_max),
+                if comments == 0 { " zero" } else { "" },
             )
         })
         .collect();
-    let filtering = !q.trim().is_empty() || !project.is_empty();
+
+    let filtering = !q.is_empty() || project.is_some() || mine;
+    let scope = {
+        let mut parts = vec![match project {
+            Some("") => "미분류".to_owned(),
+            Some(p) => escape(p),
+            None => "모든 프로젝트".to_owned(),
+        }];
+        if mine {
+            parts.push("내 문서".into());
+        }
+        if !q.is_empty() {
+            parts.push(format!("'{}' 검색", escape(&q)));
+        }
+        parts.join(", ")
+    };
+    let shown = if has_next || page_no > 1 { format!("{PAGE_SIZE}개 넘게") } else { format!("{}개", docs.len()) };
     let result_line = if filtering && !docs.is_empty() {
-        let n = if has_next || page_no > 1 { format!("{}개 넘게", PAGE_SIZE) } else { format!("{}개", docs.len()) };
-        format!("<p class=\"result\">찾은 문서 {n}. <a href=\"/\">조건 지우기</a></p>")
+        format!("<p class=\"result\">찾은 문서 {shown}. <a href=\"/\">조건 지우기</a></p>")
     } else {
         String::new()
     };
-    let body = if docs.is_empty() {
-        if filtering {
-            "<p class=\"empty\">찾는 문서가 없습니다. 검색어를 바꾸거나 <a href=\"/\">모든 프로젝트</a>로 넓혀 보세요.</p>".to_owned()
+    let sorted = |s: Sort, label: &str, class: &str| {
+        let arrow = if s == sort { if s == Sort::Title { " ↑" } else { " ↓" } } else { "" };
+        format!("<th{class}>{label}{arrow}</th>")
+    };
+    let board = if docs.is_empty() {
+        let msg = if filtering {
+            "<p class=\"empty\">찾는 문서가 없습니다. 검색어를 바꾸거나 <a href=\"/\">조건 지우기</a>로 넓혀 보세요.</p>"
         } else {
-            "<p class=\"empty\">아직 올라온 문서가 없습니다. <a href=\"/upload\">첫 HTML 올리기</a></p>".to_owned()
-        }
+            "<p class=\"empty\">아직 올라온 문서가 없습니다. <a href=\"/upload\">첫 HTML 올리기</a></p>"
+        };
+        format!("<div class=\"board\">{msg}</div>")
     } else {
         format!(
-            "<div class=\"table-wrap\"><table class=\"doc-table\"><thead><tr><th>제목</th><th>프로젝트</th><th>올린 사람</th><th>올린 시각</th>\
-             <th class=\"num\">7일 열람</th><th class=\"num\">댓글</th><th><span class=\"visually-hidden\">할 일</span></th></tr></thead>\
-             <tbody>{rows}</tbody></table></div>{pager}"
+            "<div class=\"board\"><div class=\"mhead\"><form method=\"get\" action=\"/\">{hidden_keep}\
+             <select name=\"sort\" aria-label=\"정렬\" onchange=\"this.form.submit()\">{sort_opts}</select>\
+             <noscript><button>적용</button></noscript></form><span>열람</span><span>댓글</span><span></span></div>\
+             <table><thead><tr>{}<th>프로젝트</th>{}{}{}\
+             <th><span class=\"visually-hidden\">작업</span></th></tr></thead><tbody>{rows}</tbody></table>\
+             <div class=\"board-foot\"><span>{shown} 문서, {scope}</span>{pager}</div></div>",
+            sorted(Sort::Title, "제목", ""),
+            sorted(Sort::Recent, "올린 사람, 시각", ""),
+            sorted(Sort::Views, "7일 열람", " class=\"num\""),
+            sorted(Sort::Comments, "댓글", " class=\"num\""),
         )
     };
 
-    let top: String = app
-        .docs
-        .top_viewed(5)
-        .unwrap_or_default()
+    // 옆: 많이 본 문서(순위와 막대), 최근 댓글.
+    let top = app.docs.top_viewed(5).unwrap_or_default();
+    let top_max = top.first().map_or(0, |t| t.2);
+    let top: String = top
         .iter()
-        .map(|(id, title, n)| format!("<li><a href=\"/d/{}\">{}</a><span class=\"meta\">{n}번 열람</span></li>", escape(id), escape(title)))
+        .enumerate()
+        .map(|(i, (id, title, n))| {
+            format!(
+                "<li><span class=\"no\">{}</span><a href=\"/d/{}\" title=\"{t}\">{t}</a><span class=\"n\">{n}회</span>{}</li>",
+                i + 1,
+                escape(id),
+                meter(*n, top_max),
+                t = escape(title),
+            )
+        })
         .collect();
-    let top = if top.is_empty() { "<p class=\"quiet\">지난 7일 동안 열린 문서가 없습니다.</p>".to_owned() } else { format!("<ol>{top}</ol>") };
+    let top = if top.is_empty() { "<p class=\"quiet\">지난 7일 동안 열린 문서가 없습니다.</p>".to_owned() } else { format!("<ol class=\"rank\">{top}</ol>") };
     let recent: String = app
         .docs
         .recent_comments(5)
         .unwrap_or_default()
         .iter()
         .map(|c| {
-            let body: String = c.body.chars().take(60).collect();
-            let more = if c.body.chars().count() > 60 { "…" } else { "" };
+            let body: String = c.body.chars().take(80).collect();
+            let more = if c.body.chars().count() > 80 { "…" } else { "" };
+            let initial: String = c.by_name.chars().next().map(String::from).unwrap_or_default();
             format!(
-                "<li><a href=\"/d/{}/comments\">{}</a><span class=\"meta\">{}, {}</span>{}{more}</li>",
-                escape(&c.doc_id),
-                escape(&c.doc_title),
+                "<li><span class=\"avatar sm\" aria-hidden=\"true\">{}</span><div><b>{}</b>{}<p>{}{more}</p>\
+                 <a href=\"/d/{}/comments\">{}</a></div></li>",
+                escape(&initial),
                 escape(&c.by_name),
                 when(c.created_at),
                 escape(&body),
+                escape(&c.doc_id),
+                escape(&c.doc_title),
             )
         })
         .collect();
-    let recent = if recent.is_empty() { "<p class=\"quiet\">아직 댓글이 없습니다.</p>".to_owned() } else { format!("<ul>{recent}</ul>") };
+    let recent = if recent.is_empty() { "<p class=\"quiet\">아직 댓글이 없습니다.</p>".to_owned() } else { format!("<ul class=\"cmts\">{recent}</ul>") };
 
     shell(
+        &app,
         &user,
         "/",
         &format!(
-            "<div class=\"top\"><div><h1>{}님, 안녕하세요</h1>\
-             <p class=\"lede\">팀이 Claude 로 만든 HTML 결과물을 링크로 열고 찾습니다.</p></div>\
+            "<div class=\"head\"><div><h1>문서<small>{total}개</small></h1>\
+             <p class=\"lede\">팀이 Claude로 만든 HTML 결과물을 링크로 열고 찾습니다.</p></div>\
              <a class=\"btn\" href=\"/upload\">HTML 올리기</a></div>\
-             <dl class=\"figures\"><div><dt>전체 문서</dt><dd>{total}</dd></div>\
-             <div><dt>최근 7일 열람된 문서</dt><dd>{viewed}</dd></div>\
-             <div><dt>내가 올린 문서</dt><dd>{mine}</dd></div></dl>\
-             <div class=\"grid\"><section aria-label=\"문서 목록\">\
-             <form class=\"search\" method=\"get\" action=\"/\" role=\"search\">\
-             <input type=\"search\" name=\"q\" value=\"{}\" placeholder=\"제목, 올린 사람, 본문으로 찾기\" aria-label=\"문서 찾기\">\
-             <input type=\"hidden\" name=\"project\" value=\"{}\"><button class=\"btn\">찾기</button></form>\
-             <nav class=\"chips\" aria-label=\"프로젝트\">{chips}</nav>{result_line}{body}</section>\
-             <aside><section class=\"panel\"><h2>많이 본 문서</h2>{top}</section>\
-             <section class=\"panel\"><h2>최근 댓글</h2>{recent}</section></aside></div>",
-            escape(&user.name),
+             <form class=\"search\" method=\"get\" action=\"/\" role=\"search\"><span class=\"mag\" aria-hidden=\"true\"></span>\
+             <input type=\"search\" id=\"q\" name=\"q\" value=\"{}\" placeholder=\"제목, 올린 사람, 본문으로 찾기\" aria-label=\"문서 찾기\">\
+             <kbd aria-hidden=\"true\">/</kbd><button class=\"btn quiet sm\">찾기</button></form>\
+             <div class=\"grid\"><section aria-label=\"문서\">{stats}{toolbar}{result_line}{board}</section>\
+             <aside class=\"side\"><section><h2>많이 본 문서<small>최근 7일</small></h2>{top}</section>\
+             <section><h2>최근 댓글<small>전체 {}개</small></h2>{recent}</section></aside></div>\
+             <script>document.addEventListener('keydown',e=>{{if(e.key==='/'&&!/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)){{e.preventDefault();document.getElementById('q').focus()}}}})</script>",
             escape(&q),
-            escape(&project),
+            sum.comments,
+            total = sum.total,
         ),
     )
     .into_response()
@@ -742,10 +976,11 @@ fn upload_form(app: &AppState, user: &crate::users::User, error: &str, values: (
     (
         status,
         shell(
+            &app,
             user,
             "/upload",
             &format!(
-                "<div class=\"top\"><div><h1>HTML 올리기</h1>\
+                "<div class=\"head\"><div><h1>HTML 올리기</h1>\
                  <p class=\"lede\">올린 문서는 등록된 전 직원이 볼 수 있습니다. 링크를 받아 공유하세요.</p></div></div>\
                  <form class=\"form\" method=\"post\" action=\"/upload\" enctype=\"multipart/form-data\">{}\
                  <div class=\"field\"><label for=\"title\">제목</label>\
@@ -758,7 +993,7 @@ fn upload_form(app: &AppState, user: &crate::users::User, error: &str, values: (
                  <input id=\"file\" type=\"file\" name=\"file\" accept=\".html,.htm\" required>\
                  <span class=\"hint\">.html 또는 .htm, 10MB 이하</span></div>\
                  <button class=\"btn\">올리기</button></form>\
-                 <p class=\"lede\" style=\"margin-top:24px\">Claude 에서 바로 올리려면 <a href=\"/tokens\">내 토큰</a>을 발급받으세요.</p>",
+                 <p class=\"lede\" style=\"margin-top:24px\">Claude에서 바로 올리려면 <a href=\"/tokens\">내 토큰</a>을 발급받으세요.</p>",
                 error_box(error),
                 escape(values.0),
                 escape(values.1),
@@ -861,29 +1096,38 @@ fn forbidden() -> Response {
     (StatusCode::FORBIDDEN, page("올린 사람이나 관리자만 할 수 있습니다.")).into_response()
 }
 
-/// 문서 하나에 딸린 화면(이력, 댓글, 새 버전)의 머리말. 지금 화면은 링크 대신 글자로 둔다.
-fn doc_header(doc: &Doc, here: &str) -> String {
+/// 문서 하나에 딸린 화면(이력, 댓글, 새 버전)의 머리말. 이동 경로, 메타 줄, 개수가 붙은 탭. 지금 탭은 링크 대신 글자로 둔다.
+fn doc_header(app: &AppState, doc: &Doc, here: &str) -> String {
     let id = escape(&doc.id);
-    let tab = |href: String, label: &str| {
-        if label == here { format!("<span aria-current=\"page\">{label}</span>") } else { format!("<a href=\"{href}\">{label}</a>") }
+    let versions = app.docs.versions(&doc.id).map(|v| v.len()).unwrap_or(0);
+    let (views, comments) = app.docs.activity(std::slice::from_ref(&doc.id)).unwrap_or_default().get(&doc.id).copied().unwrap_or_default();
+    let tab = |href: String, label: &str, n: usize| {
+        if label == here {
+            format!("<span aria-current=\"page\">{label} <span class=\"n\">{n}</span></span>")
+        } else {
+            format!("<a href=\"{href}\">{label} <span class=\"n\">{n}</span></a>")
+        }
     };
+    let project = if doc.project.is_empty() { "미분류".to_owned() } else { escape(&doc.project) };
     format!(
-        "<div class=\"top\"><div><h1>{}</h1><p class=\"lede\">{} 올림, {}</p></div>\
+        "<nav class=\"crumb\" aria-label=\"이동 경로\"><a href=\"/\">문서</a> /</nav>\
+         <div class=\"head\"><div><h1>{}</h1><p class=\"lede\">{project}, {}, {}, 7일 열람 {views}</p></div>\
          <a class=\"btn\" href=\"/d/{id}\">문서 열기</a></div>\
-         <nav class=\"chips\" aria-label=\"문서 메뉴\">{}{}</nav>",
+         <nav class=\"tabs\" aria-label=\"문서 메뉴\">{}{}</nav>",
         escape(&doc.title),
         escape(&doc.uploader_name),
         when(doc.created_at),
-        tab(format!("/d/{id}/history"), "이력"),
-        tab(format!("/d/{id}/comments"), "댓글"),
+        tab(format!("/d/{id}/history"), "이력", versions),
+        tab(format!("/d/{id}/comments"), "댓글", comments as usize),
     )
 }
 
-fn replace_form(user: &crate::users::User, doc: &Doc, error: &str) -> Response {
+fn replace_form(app: &AppState, user: &crate::users::User, doc: &Doc, error: &str) -> Response {
     let status = if error.is_empty() { StatusCode::OK } else { StatusCode::BAD_REQUEST };
     (
         status,
         shell(
+            &app,
             user,
             "/",
             &format!(
@@ -894,7 +1138,7 @@ fn replace_form(user: &crate::users::User, doc: &Doc, error: &str) -> Response {
                  <input id=\"file\" type=\"file\" name=\"file\" accept=\".html,.htm\" required>\
                  <span class=\"hint\">.html 또는 .htm, 10MB 이하</span></div>\
                  <button class=\"btn\">새 버전 올리기</button></form>",
-                doc_header(doc, ""),
+                doc_header(app, doc, ""),
                 error_box(error),
                 id = escape(&doc.id),
             ),
@@ -905,7 +1149,7 @@ fn replace_form(user: &crate::users::User, doc: &Doc, error: &str) -> Response {
 
 pub async fn replace_page(State(app): State<AppState>, jar: PrivateCookieJar, Path(id): Path<String>) -> Response {
     match user_and_doc(&app, &jar, &id) {
-        Ok((user, doc)) if can_modify(&user, &doc) => replace_form(&user, &doc, ""),
+        Ok((user, doc)) if can_modify(&user, &doc) => replace_form(&app, &user, &doc, ""),
         Ok(_) => forbidden(),
         Err(r) => r,
     }
@@ -926,11 +1170,11 @@ pub async fn replace(
     }
     let form = match read_form(form).await {
         Ok(f) => f,
-        Err(msg) => return replace_form(&user, &doc, msg),
+        Err(msg) => return replace_form(&app, &user, &doc, msg),
     };
     let bytes = match check_file(form.file) {
         Ok(b) => b,
-        Err(msg) => return replace_form(&user, &doc, msg),
+        Err(msg) => return replace_form(&app, &user, &doc, msg),
     };
     match app.docs.replace(&id, &user, &bytes) {
         Ok(_) => Redirect::to(&format!("/d/{id}/history")).into_response(),
@@ -982,6 +1226,7 @@ pub async fn history(State(app): State<AppState>, jar: PrivateCookieJar, Path(id
         String::new()
     };
     shell(
+        &app,
         &user,
         "/",
         &format!(
@@ -989,7 +1234,7 @@ pub async fn history(State(app): State<AppState>, jar: PrivateCookieJar, Path(id
              <p class=\"lede\" style=\"margin-bottom:12px\">되돌리면 옛 내용이 새 버전으로 올라가고, 중간 버전도 그대로 남습니다.</p>\
              <div class=\"table-wrap narrow\"><table><thead><tr><th>버전</th><th>올린 사람</th><th>올린 시각</th>\
              <th><span class=\"visually-hidden\">할 일</span></th></tr></thead><tbody>{rows}</tbody></table></div>{replace_link}",
-            doc_header(&doc, "이력"),
+            doc_header(&app, &doc, "이력"),
         ),
     )
     .into_response()
@@ -997,7 +1242,7 @@ pub async fn history(State(app): State<AppState>, jar: PrivateCookieJar, Path(id
 
 const MAX_COMMENT: usize = 2000;
 
-fn comments_page(doc: &Doc, user: &crate::users::User, comments: &[Comment], error: &str) -> Response {
+fn comments_page(app: &AppState, doc: &Doc, user: &crate::users::User, comments: &[Comment], error: &str) -> Response {
     let status = if error.is_empty() { StatusCode::OK } else { StatusCode::BAD_REQUEST };
     let id = escape(&doc.id);
     let items: String = comments
@@ -1005,15 +1250,18 @@ fn comments_page(doc: &Doc, user: &crate::users::User, comments: &[Comment], err
         .map(|c| {
             let delete = if c.by_email == user.email || user.is_admin() {
                 format!(
-                    " <form method=\"post\" action=\"/d/{id}/comments/{}/delete\" style=\"display:inline\" \
-                     onsubmit=\"return confirm('이 댓글을 지울까요?')\"><button class=\"link danger\">삭제</button></form>",
+                    "<form method=\"post\" action=\"/d/{id}/comments/{}/delete\" \
+                     onsubmit=\"return confirm('이 댓글을 지울까요?')\"><button class=\"ghost danger\">삭제</button></form>",
                     c.id
                 )
             } else {
                 String::new()
             };
+            let initial: String = c.by_name.chars().next().map(String::from).unwrap_or_default();
             format!(
-                "<li><b>{}</b> <span class=\"meta\">{}</span>{delete}<div class=\"body\">{}</div></li>",
+                "<li><span class=\"avatar sm\" aria-hidden=\"true\">{}</span><div><div class=\"who-line\"><b>{}</b>{}{delete}</div>\
+                 <div class=\"body\">{}</div></div></li>",
+                escape(&initial),
                 escape(&c.by_name),
                 when(c.created_at),
                 escape(&c.body)
@@ -1028,16 +1276,17 @@ fn comments_page(doc: &Doc, user: &crate::users::User, comments: &[Comment], err
     (
         status,
         shell(
+            &app,
             user,
             "/",
             &format!(
-                "{}<h2>댓글 {}개</h2>{list}\
-                 <form class=\"form\" method=\"post\" action=\"/d/{id}/comments\">{}\
-                 <div class=\"field\"><label for=\"body\">댓글 남기기</label>\
+                "{}<h2 class=\"visually-hidden\">댓글 {}개</h2>{list}\
+                 <form class=\"reply\" method=\"post\" action=\"/d/{id}/comments\">{}\
+                 <label for=\"body\">댓글 남기기</label>\
                  <textarea id=\"body\" name=\"body\" rows=\"4\" maxlength=\"{MAX_COMMENT}\" required></textarea>\
-                 <span class=\"hint\">{MAX_COMMENT}자까지. 쓴 사람과 관리자만 지울 수 있습니다.</span></div>\
-                 <button class=\"btn\">댓글 남기기</button></form>",
-                doc_header(doc, "댓글"),
+                 <div class=\"reply-foot\"><span class=\"hint\">{MAX_COMMENT}자까지. 쓴 사람과 관리자만 지울 수 있습니다.</span>\
+                 <button class=\"btn\">댓글 남기기</button></div></form>",
+                doc_header(app, doc, "댓글"),
                 comments.len(),
                 error_box(error),
             ),
@@ -1052,7 +1301,7 @@ pub async fn comments_view(State(app): State<AppState>, jar: PrivateCookieJar, P
         Err(r) => return r,
     };
     match app.docs.comments(&id) {
-        Ok(list) => comments_page(&doc, &user, &list, ""),
+        Ok(list) => comments_page(&app, &doc, &user, &list, ""),
         Err(e) => server_error("댓글 조회", e),
     }
 }
@@ -1075,10 +1324,10 @@ pub async fn comment_add(
     let body = form.body.trim();
     let list = || app.docs.comments(&id).unwrap_or_default();
     if body.is_empty() {
-        return comments_page(&doc, &user, &list(), "댓글 내용을 입력해 주세요.");
+        return comments_page(&app, &doc, &user, &list(), "댓글 내용을 입력해 주세요.");
     }
     if body.chars().count() > MAX_COMMENT {
-        return comments_page(&doc, &user, &list(), "댓글은 2000자 이하로 입력해 주세요.");
+        return comments_page(&app, &doc, &user, &list(), "댓글은 2000자 이하로 입력해 주세요.");
     }
     match app.docs.add_comment(&id, &user, body) {
         Ok(()) => Redirect::to(&format!("/d/{id}/comments")).into_response(),
@@ -1151,10 +1400,11 @@ pub async fn uploaded(State(app): State<AppState>, jar: PrivateCookieJar, Path(i
     };
     match app.docs.get(&id) {
         Ok(Some(d)) => shell(
+            &app,
             &user,
             "/upload",
             &format!(
-                "<div class=\"top\"><div><h1>올렸습니다</h1><p class=\"lede\">{}</p></div></div>\
+                "<div class=\"head\"><div><h1>올렸습니다</h1><p class=\"lede\">{}</p></div></div>\
                  <p>이 링크를 보내면 등록된 직원 누구나 로그인 후 볼 수 있습니다.</p>\
                  <div class=\"copy\"><input id=\"link\" readonly value=\"{base}/d/{id}\" onfocus=\"this.select()\" aria-label=\"공유 링크\">\
                  <button class=\"btn\" type=\"button\" onclick=\"navigator.clipboard.writeText(link.value);this.textContent='복사됨'\">링크 복사</button></div>\
@@ -1247,10 +1497,11 @@ pub async fn hidden_list(State(app): State<AppState>, jar: PrivateCookieJar) -> 
         )
     };
     shell(
+        &app,
         &user,
         "/admin/hidden",
         &format!(
-            "<div class=\"top\"><div><h1>숨긴 문서</h1>\
+            "<div class=\"head\"><div><h1>숨긴 문서</h1>\
              <p class=\"lede\">목록에서 지운 문서입니다. 살리면 목록과 검색에 다시 나오고 링크도 열립니다.</p></div></div>{body}"
         ),
     )
@@ -1280,6 +1531,43 @@ mod tests {
         User { email: email.into(), name: name.into(), role: "member".into() }
     }
 
+    /// 예전 시험들이 쓰던 (검색어, 프로젝트) 목록 조회. 프로젝트가 비면 전체.
+    fn ls(d: &Docs, q: &str, p: &str, offset: i64) -> Result<Vec<Doc>> {
+        d.list(&Filter { q, project: (!p.is_empty()).then_some(p), uploader: "", sort: Sort::Recent }, offset)
+    }
+
+    #[test]
+    fn 내_문서_미분류_정렬로_목록을_거른다() {
+        let (d, dir) = docs();
+        let (a, b) = (user("a@x.im", "가나"), user("b@x.im", "다라"));
+        let x = d.insert("나 제목", "A", &a, b"x").unwrap();
+        let y = d.insert("가 제목", "", &b, b"y").unwrap();
+        let z = d.insert("다 제목", "A", &a, b"z").unwrap();
+        for _ in 0..3 {
+            d.record_view(&x).unwrap();
+        }
+        d.record_view(&y).unwrap();
+        d.add_comment(&y, &a, "1").unwrap();
+        d.add_comment(&y, &a, "2").unwrap();
+        d.add_comment(&z, &a, "3").unwrap();
+        let titles = |f: Filter| d.list(&f, 0).unwrap().into_iter().map(|x| x.title).collect::<Vec<_>>();
+        let f = |project, uploader, sort| Filter { q: "", project, uploader, sort };
+        assert_eq!(titles(f(None, "a@x.im", Sort::Recent)), ["다 제목", "나 제목"], "내 문서만");
+        assert_eq!(titles(f(Some(""), "", Sort::Recent)), ["가 제목"], "미분류만");
+        assert_eq!(titles(f(None, "", Sort::Views)), ["나 제목", "가 제목", "다 제목"], "7일 열람 많은 순");
+        assert_eq!(titles(f(None, "", Sort::Comments)), ["가 제목", "다 제목", "나 제목"], "댓글 많은 순");
+        assert_eq!(titles(f(None, "", Sort::Title)), ["가 제목", "나 제목", "다 제목"], "제목 순");
+        assert_eq!(Sort::parse("views"), Sort::Views);
+        assert_eq!(Sort::parse("엉뚱한 값"), Sort::Recent);
+        assert_eq!(d.project_counts().unwrap(), [("A".to_owned(), 2), ("".to_owned(), 1)], "미분류는 맨 뒤");
+        let daily = d.daily_views().unwrap();
+        assert_eq!(daily.len(), 7);
+        assert_eq!(daily.iter().map(|(_, n)| n).sum::<i64>(), 4);
+        assert_eq!(daily[6].1, 4, "오늘 칸에 쌓인다");
+        assert!(daily.windows(2).all(|w| w[1].0 - w[0].0 == 86400), "하루씩");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn docs() -> (Docs, PathBuf) {
         let dir = std::env::temp_dir().join(format!("html-hub-test-{}", CsrfToken::new_random().secret()));
         (Docs::open(":memory:", dir.to_str().unwrap()).unwrap(), dir)
@@ -1300,11 +1588,11 @@ mod tests {
         let (d, dir) = docs();
         d.insert("월간 보고", "A", &user("a@x.im", "가나"), b"1").unwrap();
         d.insert("설계 메모", "B", &user("b@x.im", "다라"), b"2").unwrap();
-        assert_eq!(d.list("", "", 0).unwrap().len(), 2);
-        assert_eq!(d.list("보고", "", 0).unwrap()[0].title, "월간 보고");
-        assert_eq!(d.list("다라", "", 0).unwrap()[0].title, "설계 메모");
-        assert_eq!(d.list("", "A", 0).unwrap().len(), 1);
-        assert_eq!(d.list("%", "", 0).unwrap().len(), 0, "% 는 특수문자가 아니라 글자로 찾는다");
+        assert_eq!(ls(&d, "", "", 0).unwrap().len(), 2);
+        assert_eq!(ls(&d, "보고", "", 0).unwrap()[0].title, "월간 보고");
+        assert_eq!(ls(&d, "다라", "", 0).unwrap()[0].title, "설계 메모");
+        assert_eq!(ls(&d, "", "A", 0).unwrap().len(), 1);
+        assert_eq!(ls(&d, "%", "", 0).unwrap().len(), 0, "% 는 특수문자가 아니라 글자로 찾는다");
         assert_eq!(d.projects().unwrap(), ["A", "B"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1314,7 +1602,7 @@ mod tests {
         let (d, dir) = docs();
         d.insert("첫째", "", &user("a@x.im", "가나"), b"1").unwrap();
         d.insert("둘째", "", &user("a@x.im", "가나"), b"2").unwrap();
-        assert_eq!(d.list("", "", 0).unwrap()[0].title, "둘째");
+        assert_eq!(ls(&d, "", "", 0).unwrap()[0].title, "둘째");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1324,7 +1612,7 @@ mod tests {
         let id = d.insert("지울 것", "A", &user("a@x.im", "가나"), b"x").unwrap();
         d.hide(&id).unwrap();
         assert!(d.get(&id).unwrap().is_none());
-        assert!(d.list("", "", 0).unwrap().is_empty());
+        assert!(ls(&d, "", "", 0).unwrap().is_empty());
         assert!(d.projects().unwrap().is_empty());
         assert_eq!(d.read(&id).unwrap(), b"x");
         std::fs::remove_dir_all(dir).unwrap();
@@ -1396,15 +1684,15 @@ mod tests {
         let (d, dir) = docs();
         let a = user("a@x.im", "가나");
         let id = d.insert("보고", "", &a, "<p>분기 매출 요약</p><script>토큰</script>".as_bytes()).unwrap();
-        assert_eq!(d.list("매출", "", 0).unwrap().len(), 1);
-        assert_eq!(d.list("토큰", "", 0).unwrap().len(), 0, "script 안의 글자는 찾지 않는다");
+        assert_eq!(ls(&d, "매출", "", 0).unwrap().len(), 1);
+        assert_eq!(ls(&d, "토큰", "", 0).unwrap().len(), 0, "script 안의 글자는 찾지 않는다");
         d.replace(&id, &a, "<p>새 내용</p>".as_bytes()).unwrap();
-        assert_eq!(d.list("매출", "", 0).unwrap().len(), 0, "이전 버전 본문은 색인하지 않는다");
-        assert_eq!(d.list("새 내용", "", 0).unwrap().len(), 1);
+        assert_eq!(ls(&d, "매출", "", 0).unwrap().len(), 0, "이전 버전 본문은 색인하지 않는다");
+        assert_eq!(ls(&d, "새 내용", "", 0).unwrap().len(), 1);
         d.restore(&id, 1, &a).unwrap();
-        assert_eq!(d.list("매출", "", 0).unwrap().len(), 1);
+        assert_eq!(ls(&d, "매출", "", 0).unwrap().len(), 1);
         d.hide(&id).unwrap();
-        assert_eq!(d.list("매출", "", 0).unwrap().len(), 0, "숨긴 문서는 본문으로도 안 나온다");
+        assert_eq!(ls(&d, "매출", "", 0).unwrap().len(), 0, "숨긴 문서는 본문으로도 안 나온다");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1431,10 +1719,10 @@ mod tests {
         for i in 0..PAGE_SIZE + 3 {
             d.insert(&format!("문서{i}"), "", &a, b"x").unwrap();
         }
-        let first = d.list("", "", 0).unwrap();
+        let first = ls(&d, "", "", 0).unwrap();
         assert_eq!(first.len() as i64, PAGE_SIZE + 1, "다음 쪽이 있으면 한 개 더 온다");
         assert_eq!(first[0].title, format!("문서{}", PAGE_SIZE + 2));
-        let second = d.list("", "", PAGE_SIZE).unwrap();
+        let second = ls(&d, "", "", PAGE_SIZE).unwrap();
         assert_eq!(second.len(), 3);
         assert_eq!(second[2].title, "문서0");
         std::fs::remove_dir_all(dir).unwrap();
@@ -1452,7 +1740,7 @@ mod tests {
         assert!(d.unhide(&id).unwrap());
         assert!(d.hidden().unwrap().is_empty());
         assert!(d.get(&id).unwrap().is_some());
-        assert_eq!(d.list("본문글", "", 0).unwrap().len(), 1, "본문 검색에도 다시 걸린다");
+        assert_eq!(ls(&d, "본문글", "", 0).unwrap().len(), 1, "본문 검색에도 다시 걸린다");
         assert!(!d.unhide(&id).unwrap(), "숨기지 않은 문서는 바뀌지 않는다");
         assert!(!d.unhide("없는번호").unwrap());
         std::fs::remove_dir_all(dir).unwrap();
@@ -1464,7 +1752,8 @@ mod tests {
         assert_eq!(relative(now - 10, now), "방금");
         assert_eq!(relative(now - 5 * 60, now), "5분 전");
         assert_eq!(relative(now - 3 * 3600, now), "3시간 전");
-        assert_eq!(relative(now - 2 * 86400, now), "2일 전");
+        assert_eq!(relative(now - 21 * 3600, now), "어제", "날짜가 바뀌었으면 시간이 아니라 어제");
+        assert_eq!(relative(now - 2 * 86400, now), "11월 16일", "그 전은 날짜");
         assert_eq!(relative(now - 30 * 86400, now), "10월 19일");
         assert_eq!(relative(now - 400 * 86400, now), "2025년 10월 14일");
         assert_eq!(relative(now + 30, now), "방금", "서버 시계가 조금 어긋나도 미래로 보이지 않는다");
@@ -1491,7 +1780,8 @@ mod tests {
         d.add_comment(&x, &b, "최근 댓글").unwrap();
         d.hide(&z).unwrap();
 
-        assert_eq!(d.summary("a@x.im").unwrap(), (2, 2, 1));
+        let sum = d.summary("a@x.im").unwrap();
+        assert_eq!((sum.total, sum.viewed, sum.mine, sum.hidden, sum.comments), (2, 2, 1, 1, 2), "숨긴 문서의 댓글은 세지 않는다");
         let top = d.top_viewed(5).unwrap();
         assert_eq!(top.iter().map(|t| (t.1.as_str(), t.2)).collect::<Vec<_>>(), [("많이 본", 3), ("조금 본", 1)]);
         let recent = d.recent_comments(5).unwrap();
