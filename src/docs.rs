@@ -847,10 +847,12 @@ pub async fn uploaded(State(app): State<AppState>, jar: PrivateCookieJar, Path(i
     match app.docs.get(&id) {
         Ok(Some(d)) => page(&format!(
             "<p>올렸습니다: <a href=\"/d/{id}\">{}</a></p>\
-             <p>링크: <code>/d/{id}</code> (이 주소 앞에 사이트 주소를 붙여 공유하세요)</p>\
+             <p><input id=\"link\" readonly size=\"60\" value=\"{base}/d/{id}\" onfocus=\"this.select()\"> \
+             <button type=\"button\" onclick=\"navigator.clipboard.writeText(link.value);this.textContent='복사됨'\">링크 복사</button></p>\
              <p><a href=\"/\">목록으로</a></p>",
             escape(&d.title),
             id = escape(&d.id),
+            base = escape(app.base_url.trim_end_matches('/')),
         ))
         .into_response(),
         Ok(None) => not_found(),
