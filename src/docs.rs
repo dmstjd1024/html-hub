@@ -92,7 +92,9 @@ impl Docs {
                 body TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
                 deleted_at INTEGER
-            );",
+            );
+            -- 북극성 지표(주간 열람된 문서 수)용. 누가 봤는지는 남기지 않는다.
+            CREATE TABLE IF NOT EXISTS views (doc_id TEXT NOT NULL, at INTEGER NOT NULL);",
         )?;
         std::fs::create_dir_all(dir)?;
         let docs = Self {
@@ -310,6 +312,14 @@ impl Docs {
             "UPDATE documents SET deleted_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
             params![id, now_unix()],
         )?;
+        Ok(())
+    }
+
+    pub fn record_view(&self, id: &str) -> Result<()> {
+        self.db
+            .lock()
+            .unwrap()
+            .execute("INSERT INTO views (doc_id, at) VALUES (?1, ?2)", params![id, now_unix()])?;
         Ok(())
     }
 }
@@ -854,7 +864,13 @@ pub async fn view(State(app): State<AppState>, jar: PrivateCookieJar, Path(id): 
     }
     match app.docs.get(&id) {
         Ok(Some(_)) => match app.docs.read(&id) {
-            Ok(bytes) => document_response(bytes),
+            Ok(bytes) => {
+                // 기록이 실패해도 문서는 보여 준다.
+                if let Err(e) = app.docs.record_view(&id) {
+                    eprintln!("열람 기록 실패: {e}");
+                }
+                document_response(bytes)
+            }
             Err(e) => server_error("문서 파일 읽기", e),
         },
         Ok(None) => not_found(),
@@ -1032,6 +1048,29 @@ mod tests {
         assert_eq!(d.comments(&id).unwrap().len(), 1);
         assert!(d.comment(&id, list[0].id).unwrap().is_none());
         assert!(d.comment("다른문서", list[1].id).unwrap().is_none(), "다른 문서의 댓글 번호로는 못 찾는다");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn 열람을_문서번호와_시각만으로_기록한다() {
+        let (d, dir) = docs();
+        let id = d.insert("문서", "", &user("a@x.im", "가나"), b"x").unwrap();
+        d.record_view(&id).unwrap();
+        d.record_view(&id).unwrap();
+        let conn = d.db.lock().unwrap();
+        let (rows, docs): (i64, i64) = conn
+            .query_row("SELECT COUNT(*), COUNT(DISTINCT doc_id) FROM views", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((rows, docs), (2, 1));
+        let cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('views')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(cols, ["doc_id", "at"], "누가 봤는지는 남기지 않는다");
+        drop(conn);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
