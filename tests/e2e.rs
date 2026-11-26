@@ -231,6 +231,8 @@ async fn 공개_화면은_healthz_privacy_terms_login_뿐이다() {
     let r = s.get("/login", None).await;
     assert_eq!(r.status, StatusCode::SEE_OTHER);
     assert!(r.location().starts_with("https://accounts.google.com/"), "{}", r.location());
+    // 구글이 마지막에 쓴 계정(예: 개인 Gmail)으로 조용히 넘기지 않게 늘 계정 선택 화면을 띄운다.
+    assert!(r.location().contains("prompt=select_account"), "{}", r.location());
     let set = r.headers.get(header::SET_COOKIE).unwrap().to_str().unwrap();
     assert!(set.starts_with("oauth=") && set.contains("Max-Age=1800") && set.contains("HttpOnly"), "{set}");
 }

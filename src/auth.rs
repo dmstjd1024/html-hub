@@ -6,7 +6,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
 };
 use axum_extra::extract::cookie::{Cookie, PrivateCookieJar, SameSite};
-use openidconnect::core::{CoreClient, CoreProviderMetadata, CoreResponseType};
+use openidconnect::core::{CoreAuthPrompt, CoreClient, CoreProviderMetadata, CoreResponseType};
 use openidconnect::{
     AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet,
     EndpointNotSet, EndpointSet, IssuerUrl, Nonce, PkceCodeChallenge, PkceCodeVerifier,
@@ -414,6 +414,8 @@ pub async fn login(
             Nonce::new_random,
         )
         .add_scope(Scope::new("email".into()))
+        // 구글은 마지막에 쓴 계정(개인 Gmail 등)으로 조용히 넘길 수 있다. 늘 계정을 고르게 한다.
+        .add_prompt(CoreAuthPrompt::SelectAccount)
         .set_pkce_challenge(challenge)
         .url();
     let pending = Pending {
@@ -516,8 +518,14 @@ pub async fn callback(
         Ok(None) => {
             eprintln!("명단에 없는 로그인 시도: {email}");
             (
-            StatusCode::FORBIDDEN,
-            page("등록되지 않았거나 비활성화된 계정입니다. IT 팀에 문의하세요."),
+                StatusCode::FORBIDDEN,
+                jar.remove(expired(OAUTH_COOKIE)),
+                page(&format!(
+                    "<p><b>{}</b> 계정은 등록되지 않았거나 비활성화되어 들어올 수 없습니다.</p>\
+                     <p>회사 계정으로 다시 로그인하세요. 회사 계정인데도 안 되면 IT 팀에 문의하세요.</p>\
+                     <p><a class=\"btn\" href=\"/login\">다른 계정으로 로그인</a></p>",
+                    escape(&email)
+                )),
             )
                 .into_response()
         }
