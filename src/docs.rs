@@ -612,18 +612,42 @@ pub fn when(unix: i64) -> String {
     format!("<time datetime=\"{iso}\" title=\"{}\">{}</time>", show_time(unix), relative(unix, now_unix()))
 }
 
+/// 격리된 문서는 출처가 없어(opaque origin) localStorage·sessionStorage 가 SecurityError 를 던진다.
+/// 그러면 저장소를 쓰는 React 앱이 통째로 멈추므로, 막혔을 때만 메모리 저장소로 바꿔 끼운다 (새로고침하면 사라진다).
+const STORAGE_SHIM: &str = "<script>(function(){function m(){var d={};return{getItem:function(k){return Object.prototype.hasOwnProperty.call(d,k)?d[k]:null},setItem:function(k,v){d[k]=String(v)},removeItem:function(k){delete d[k]},clear:function(){d={}},key:function(i){return Object.keys(d)[i]||null},get length(){return Object.keys(d).length}}}['localStorage','sessionStorage'].forEach(function(n){try{window[n].getItem('_')}catch(e){try{Object.defineProperty(window,n,{value:m(),configurable:true})}catch(_){}}})})();</script>";
+
+/// 저장소 대체 코드를 문서 앞에 넣는다. `<!doctype ...>` 이 있으면 그 뒤에 넣는다 (앞에 넣으면 호환 모드로 그려진다).
+/// 저장된 파일은 바꾸지 않고 내보낼 때만 붙인다.
+fn with_storage_shim(bytes: Vec<u8>) -> Vec<u8> {
+    let lead = bytes.iter().position(|b| !b" \t\r\n".contains(b) && !matches!(b, 0xEF | 0xBB | 0xBF)).unwrap_or(0);
+    let at = match bytes.get(lead..lead + 9) {
+        Some(head) if head.eq_ignore_ascii_case(b"<!doctype") => {
+            bytes[lead..].iter().position(|&b| b == b'>').map_or(0, |end| lead + end + 1)
+        }
+        _ => 0,
+    };
+    let mut out = Vec::with_capacity(bytes.len() + STORAGE_SHIM.len());
+    out.extend_from_slice(&bytes[..at]);
+    out.extend_from_slice(STORAGE_SHIM.as_bytes());
+    out.extend_from_slice(&bytes[at..]);
+    out
+}
+
 /// 올린 HTML 을 내보내는 응답. sandbox 로 앱과 분리해 실행해서 문서 안의 JS 가 로그인 세션을 쓰지 못하게 한다 (정책서 S1).
-/// allow-same-origin 은 주지 않는다.
+/// allow-same-origin 과 allow-top-navigation 은 주지 않는다. 새 창·알림·폼·다운로드는 출처가 없는 채로 허용해 Claude 결과물이 깨지지 않게 한다.
 fn document_response(bytes: Vec<u8>) -> Response {
     (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            (header::CONTENT_SECURITY_POLICY, "sandbox allow-scripts"),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox allow-modals allow-forms allow-downloads",
+            ),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
             (header::REFERRER_POLICY, "no-referrer"),
             (header::CACHE_CONTROL, "private, no-store"),
         ],
-        bytes,
+        with_storage_shim(bytes),
     )
         .into_response()
 }
@@ -1858,8 +1882,24 @@ mod tests {
     fn 문서_응답은_격리_헤더를_붙인다() {
         let res = document_response(b"<script>1</script>".to_vec());
         let h = res.headers();
-        assert_eq!(h[header::CONTENT_SECURITY_POLICY], HeaderValue::from_static("sandbox allow-scripts"));
+        let csp = h[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+        assert!(csp.starts_with("sandbox allow-scripts"));
+        for allowed in ["allow-popups", "allow-modals", "allow-forms", "allow-downloads"] {
+            assert!(csp.contains(allowed), "{allowed}");
+        }
+        assert!(!csp.contains("allow-same-origin") && !csp.contains("allow-top-navigation"), "격리는 그대로");
         assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], HeaderValue::from_static("nosniff"));
-        assert!(!h[header::CONTENT_SECURITY_POLICY].to_str().unwrap().contains("allow-same-origin"));
+    }
+
+    #[test]
+    fn 저장소_대체_코드는_doctype_뒤에_들어간다() {
+        let out = String::from_utf8(with_storage_shim(b"<!DOCTYPE html>\n<p>a</p>".to_vec())).unwrap();
+        assert!(out.starts_with("<!DOCTYPE html><script>") && out.ends_with("\n<p>a</p>"), "doctype 이 맨 앞이어야 표준 모드로 그려진다");
+        let out = String::from_utf8(with_storage_shim("\u{feff}  <!doctype html><p>b</p>".as_bytes().to_vec())).unwrap();
+        assert!(out.starts_with("\u{feff}  <!doctype html><script>") && out.ends_with("<p>b</p>"));
+        let out = String::from_utf8(with_storage_shim(b"<p>c</p>".to_vec())).unwrap();
+        assert!(out.starts_with("<script>") && out.ends_with("</script><p>c</p>"), "doctype 이 없으면 맨 앞");
+        let out = with_storage_shim(b"<!doctype".to_vec());
+        assert!(out.ends_with(b"<!doctype"), "닫히지 않은 doctype 은 건드리지 않고 앞에 붙인다");
     }
 }

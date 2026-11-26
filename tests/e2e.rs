@@ -145,9 +145,11 @@ impl Server {
 
     async fn post(&self, path: &str, cookie: Option<&str>, fields: &[(&str, &str)]) -> Res {
         let body: String = form_urlencoded::Serializer::new(String::new()).extend_pairs(fields).finish();
+        // 브라우저처럼 같은 사이트의 화면에서 보낸 요청이라는 Origin 을 붙인다.
         let req = self
             .http
             .post(format!("{}{path}", self.base))
+            .header(header::ORIGIN, &self.base)
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
             .body(body);
         self.send(req, cookie).await
@@ -176,6 +178,10 @@ impl Server {
         if let Some(t) = bearer {
             req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
         }
+        // 쿠키로 보내는 요청은 브라우저 화면에서 온 것처럼 Origin 을 붙인다. 토큰 API(도구)는 붙이지 않는다.
+        if cookie.is_some() {
+            req = req.header(header::ORIGIN, &self.base);
+        }
         self.send(req, cookie).await
     }
 
@@ -203,6 +209,13 @@ impl Drop for Server {
 
 fn now_nanos() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+}
+
+/// 내보낸 문서에서 서버가 붙인 저장소 대체 코드를 뺀 원본. 대체 코드가 없으면 실패한다.
+fn original(body: &str) -> String {
+    let start = body.find("<script>(function(){function m()").expect("저장소 대체 코드가 붙어 있어야 한다");
+    let end = start + body[start..].find("</script>").unwrap() + "</script>".len();
+    format!("{}{}", &body[..start], &body[end..])
 }
 
 /// 목록 표의 제목 칸들 (`<a class="doc-title" href="/d/..">제목</a>`), 위에서부터. 옆 패널의 링크는 세지 않는다.
@@ -303,6 +316,7 @@ async fn r1_1_올리기_화면과_입력_검사() {
         .http
         .post(format!("{}/upload", s.base))
         .header(header::COOKIE, &me)
+        .header(header::ORIGIN, &s.base)
         .header(header::CONTENT_TYPE, format!("multipart/form-data; boundary={boundary}"))
         .body(big)
         .send()
@@ -362,9 +376,11 @@ async fn r1_2_링크로_열기() {
     for who in [OWNER, OTHER] {
         let r = s.get(&format!("/d/{id}"), Some(&s.login(who))).await;
         assert_eq!(r.status, StatusCode::OK);
-        assert_eq!(r.body, html);
+        assert_eq!(original(&r.body), html, "올린 내용 그대로 (대체 코드는 doctype 뒤에만)");
+        assert!(r.body.starts_with("<!doctype html><script>"), "doctype 이 맨 앞");
         let csp = r.headers.get(header::CONTENT_SECURITY_POLICY).unwrap().to_str().unwrap();
-        assert_eq!(csp, "sandbox allow-scripts", "문서 속 JS 가 앱 쿠키·세션을 쓰지 못하게 격리");
+        assert!(csp.starts_with("sandbox allow-scripts") && csp.contains("allow-popups") && csp.contains("allow-modals"), "{csp}");
+        assert!(!csp.contains("allow-same-origin") && !csp.contains("allow-top-navigation"), "문서 속 JS 가 앱 쿠키·세션을 쓰지 못하게 격리");
         assert_eq!(r.headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
     }
 
@@ -520,8 +536,8 @@ async fn r2_새_버전_교체_이력_되돌리기() {
     let r = replace(&owner, "v.html", "<p>v2 새내용</p>").await;
     assert_eq!(r.location(), format!("/d/{id}/history"));
 
-    assert_eq!(s.get(&format!("/d/{id}"), Some(&other)).await.body, "<p>v2 새내용</p>", "링크는 그대로, 내용은 새 버전");
-    assert_eq!(s.get(&format!("/d/{id}/v/1"), Some(&other)).await.body, "<p>v1 첫내용</p>");
+    assert_eq!(original(&s.get(&format!("/d/{id}"), Some(&other)).await.body), "<p>v2 새내용</p>", "링크는 그대로, 내용은 새 버전");
+    assert_eq!(original(&s.get(&format!("/d/{id}/v/1"), Some(&other)).await.body), "<p>v1 첫내용</p>");
     assert_eq!(s.get(&format!("/d/{id}/v/9"), Some(&other)).await.status, StatusCode::NOT_FOUND);
     let hist = s.get(&format!("/d/{id}/history"), Some(&other)).await.body;
     assert!(hist.contains(&format!("/d/{id}/v/1")) && hist.contains(&format!("/d/{id}/v/2")));
@@ -533,7 +549,7 @@ async fn r2_새_버전_교체_이력_되돌리기() {
     // 되돌리기: 올린 사람만, 옛 내용이 새 버전(3)으로 쌓인다.
     assert_eq!(s.post(&format!("/d/{id}/restore/1"), Some(&other), &[]).await.status, StatusCode::FORBIDDEN);
     assert_eq!(s.post(&format!("/d/{id}/restore/1"), Some(&owner), &[]).await.status, StatusCode::SEE_OTHER);
-    assert_eq!(s.get(&format!("/d/{id}"), Some(&owner)).await.body, "<p>v1 첫내용</p>");
+    assert_eq!(original(&s.get(&format!("/d/{id}"), Some(&owner)).await.body), "<p>v1 첫내용</p>");
     assert!(s.get(&format!("/d/{id}/history"), Some(&owner)).await.body.contains(&format!("/d/{id}/v/3")));
     assert_eq!(s.post(&format!("/d/{id}/restore/9"), Some(&owner), &[]).await.status, StatusCode::NOT_FOUND);
 }
@@ -742,3 +758,36 @@ async fn 올리기_오류가_나도_입력한_제목과_프로젝트는_남는�
     assert!(r.body.contains("value=\"분기 보고\"") && r.body.contains("value=\"재무\""));
 }
 
+// ---------- 위조 요청 차단 ----------
+
+#[tokio::test]
+async fn 다른_출처나_격리된_문서에서_온_post_는_거절한다() {
+    let s = Server::start().await;
+    let me = s.login(OWNER);
+    let id = s.upload(&me, "지킬 문서", "", "<p>x</p>").await;
+    // 격리된 문서(Origin: null), 다른 사이트, Origin 없음 모두 거절. 쿠키가 실려 와도 소용없다.
+    for origin in [Some("null"), Some("https://evil.example"), None] {
+        for path in ["/tokens".to_owned(), format!("/d/{id}/delete"), "/logout".to_owned(), format!("/d/{id}/comments")] {
+            let mut req = s
+                .http
+                .post(format!("{}{path}", s.base))
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body("body=%EC%9C%84%EC%A1%B0");
+            if let Some(o) = origin {
+                req = req.header(header::ORIGIN, o);
+            }
+            let r = s.send(req, Some(&me)).await;
+            assert_eq!(r.status, StatusCode::FORBIDDEN, "{origin:?} {path}");
+            assert!(r.headers.get(header::SET_COOKIE).is_none(), "거절할 때 로그아웃시키지 않는다");
+        }
+    }
+    let tokens: i64 = s.db().query_row("SELECT COUNT(*) FROM api_tokens", [], |r| r.get(0)).unwrap();
+    let comments: i64 = s.db().query_row("SELECT COUNT(*) FROM comments", [], |r| r.get(0)).unwrap();
+    assert_eq!((tokens, comments), (0, 0), "아무것도 바뀌지 않았다");
+    assert_eq!(s.get(&format!("/d/{id}"), Some(&me)).await.status, StatusCode::OK, "문서는 그대로");
+    // 같은 사이트 화면에서 보낸 요청은 된다. 토큰 API(Origin 없음, 쿠키 없음)도 된다.
+    assert_eq!(s.post("/tokens", Some(&me), &[]).await.status, StatusCode::OK);
+    let token = issue_token(&s, &me).await;
+    let r = s.multipart("/api/upload", None, Some(&token), &[("title", "도구")], Some(("a.html", b"<p>t</p>"))).await;
+    assert_eq!(r.status, StatusCode::CREATED);
+}

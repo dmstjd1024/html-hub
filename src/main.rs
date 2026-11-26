@@ -6,7 +6,10 @@ mod users;
 use anyhow::{Context, Result, bail};
 use axum::{
     Router,
-    extract::{DefaultBodyLimit, FromRef},
+    extract::{DefaultBodyLimit, FromRef, Request, State},
+    http::{Method, StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use axum_extra::extract::cookie::Key;
@@ -27,6 +30,27 @@ impl FromRef<AppState> for Key {
     fn from_ref(app: &AppState) -> Key {
         app.key.clone()
     }
+}
+
+/// 상태를 바꾸는 요청(POST 등)은 이 사이트의 화면에서 보낸 것만 받는다 (위조 요청 방지).
+/// 격리된 문서 속 폼은 Origin: null 을 보내고, 다른 사이트는 자기 출처를 보낸다. 쿠키가 실려 와도 거절한다.
+/// 토큰으로 올리는 /api/upload 는 쿠키를 쓰지 않으므로 검사하지 않는다.
+async fn same_origin_only(State(origin): State<String>, req: Request, next: Next) -> Response {
+    let reads = matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
+    let from_here = req.headers().get(header::ORIGIN).is_some_and(|o| o.as_bytes() == origin.as_bytes());
+    if reads || from_here || req.uri().path() == "/api/upload" {
+        return next.run(req).await;
+    }
+    eprintln!("다른 출처의 요청 거절: {} {} (Origin {:?})", req.method(), req.uri().path(), req.headers().get(header::ORIGIN));
+    (StatusCode::FORBIDDEN, auth::page("다른 화면에서 보낸 요청이라 처리하지 않았습니다. <a href=\"/\">목록으로</a>")).into_response()
+}
+
+/// BASE_URL 에서 출처(scheme://host[:port])만 뗀다. Origin 헤더와 같은 꼴이다.
+fn origin_of(base_url: &str) -> String {
+    let rest = base_url.split_once("://").map_or(base_url, |(_, r)| r);
+    let host = rest.split('/').next().unwrap_or(rest);
+    let scheme = base_url.split_once("://").map_or("http", |(s, _)| s);
+    format!("{scheme}://{host}")
 }
 
 fn env(name: &str) -> Result<String> {
@@ -109,10 +133,23 @@ async fn main() -> Result<()> {
             oidc: Arc::new(oidc),
             key: Key::from(session_key.as_bytes()),
             secure_cookies: base_url.starts_with("https://"),
-        });
+        })
+        .layer(middleware::from_fn_with_state(origin_of(&base_url), same_origin_only));
 
     let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into());
     println!("{addr} 에서 대기 중 ({base_url})");
     axum::serve(tokio::net::TcpListener::bind(&addr).await?, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::origin_of;
+
+    #[test]
+    fn base_url_에서_출처만_뗀다() {
+        assert_eq!(origin_of("https://survey.eunseong.dev"), "https://survey.eunseong.dev");
+        assert_eq!(origin_of("https://survey.eunseong.dev/"), "https://survey.eunseong.dev");
+        assert_eq!(origin_of("http://127.0.0.1:3000/hub"), "http://127.0.0.1:3000");
+    }
 }
