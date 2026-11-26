@@ -157,4 +157,4 @@
   ```
   sqlite3 data/html-hub.db "SELECT COUNT(DISTINCT doc_id) FROM views WHERE at >= strftime('%s','now','-7 days')"
   ```
-- 자동 테스트 19개 통과.
+- 자동 테스트 19개 통과. 실서버 확인: 배포 뒤 문서를 한 번 열자 `views` 에 1행(문서 번호, 시각)이 생겼다.
