@@ -268,3 +268,10 @@ Claude 결과물에 흔한 HTML 4종(Chart.js·구글 폰트 리포트, Tailwind
 - 휴대폰(860px 이하)에서 안내 화면(첫 화면, 오류, 약관, 로그아웃)은 카드 테두리 없이 화면 전체를 쓰고 로그인 버튼은 가로로 꽉 찬다.
 - 확인: 첫 화면과 로그인 뒤 13개 화면(목록, 올리기, 올림 완료, 내 토큰, 관리자 2개, 문서·이력·댓글·교체, 약관 2개, 없는 문서)을 320·375·1280px 에서 열어 가로 넘침 0건. 토큰과 댓글이 있는 상태로 다시 봤다. E2E 17개(첫 화면 검사 추가)·단위 28개 통과.
 - 범위 밖: 올린 HTML 자체가 휴대폰에 맞는지는 만든 사람 몫이다. 서버가 문서를 고치지 않는다.
+
+## Claude 아티팩트 실서버 확인 (2026-11-27)
+
+Claude 가 흔히 만드는 꼴 4가지(Chart.js 대시보드, Tailwind CDN, React 18 + Babel, Mermaid 문서)를 MCP 도구로 실서버에 올려 브라우저에서 열었다. 차트 그리기·탭 전환·localStorage(대체 저장소), Tailwind 스타일·CSV 내려받기, React 입력·추가·alert, Mermaid 도형·새 창 링크가 모두 동작했고 휴대폰 폭(375px)에서도 가로 넘침이 없었다.
+
+- 이때 발견: 모든 문서에서 `SecurityError: Blocked a frame with origin "null"` 가 났다. 원인은 앱이나 문서가 아니라 Cloudflare 가 응답에 끼워 넣은 스크립트(Web Analytics beacon, JavaScript Detections)였다. 이 스크립트가 숨은 iframe 의 문서를 읽으려다 격리(sandbox) 때문에 막힌다.
+- 고친 방법: 올린 문서 응답에만 `Cache-Control: no-transform` 을 붙여 Cloudflare 가 문서 내용을 바꾸지 않게 했다. 앱 화면은 그대로 둔다. 대신 이 응답은 Cloudflare 압축을 받지 않는다 (문서는 10MB 이하라 감수한다).

@@ -645,7 +645,8 @@ fn document_response(bytes: Vec<u8>) -> Response {
             ),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
             (header::REFERRER_POLICY, "no-referrer"),
-            (header::CACHE_CONTROL, "private, no-store"),
+            // no-transform: Cloudflare 가 분석·봇 탐지 스크립트를 문서에 끼워 넣지 않게 한다 (격리된 문서에서 오류를 낸다).
+            (header::CACHE_CONTROL, "private, no-store, no-transform"),
         ],
         with_storage_shim(bytes),
     )

@@ -387,6 +387,8 @@ async fn r1_2_링크로_열기() {
         assert!(csp.starts_with("sandbox allow-scripts") && csp.contains("allow-popups") && csp.contains("allow-modals"), "{csp}");
         assert!(!csp.contains("allow-same-origin") && !csp.contains("allow-top-navigation"), "문서 속 JS 가 앱 쿠키·세션을 쓰지 못하게 격리");
         assert_eq!(r.headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+        // Cloudflare 가 분석 스크립트를 끼워 넣지 않게 한다.
+        assert!(r.headers.get(header::CACHE_CONTROL).unwrap().to_str().unwrap().contains("no-transform"));
     }
 
     // 없는 번호는 안내만.
