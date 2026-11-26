@@ -720,7 +720,7 @@ async fn 대시보드는_요약_숫자와_많이_본_문서와_최근_댓글을_
     // 숨긴 문서는 숫자와 패널에서 빠진다.
     s.post(&format!("/d/{hot}/delete"), Some(&owner), &[]).await;
     let r = s.get("/", Some(&owner)).await.body;
-    assert!(r.contains("<dt>전체 문서</dt><dd>1</dd>") && !r.contains("자주 보는 보고서"));
+    assert!(r.contains("<dt>전체 문서</dt><dd>1<span class=\"sub\">") && !r.contains("자주 보는 보고서"));
 
     // 메뉴 띠는 지금 화면과 문서 수를 표시하고, 관리 메뉴(숨긴 문서 수)는 관리자에게만 보인다.
     assert!(r.contains("<a href=\"/\" aria-current=\"page\">문서<span class=\"count\">1</span></a>"));

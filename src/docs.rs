@@ -713,7 +713,11 @@ pub async fn index(
     // 요약: 전체 문서, 최근 7일 열람(하루별 막대), 내가 올린 문서.
     let named = counts.iter().filter(|(p, _)| !p.is_empty()).count();
     let unfiled_n = counts.iter().find(|(p, _)| p.is_empty()).map_or(0, |c| c.1);
-    let unfiled_note = if unfiled_n > 0 { format!(", 미분류 {unfiled_n}") } else { String::new() };
+    let unfiled_note = if unfiled_n > 0 {
+        format!("<span class=\"unfiled-note\"><span class=\"sep\" aria-hidden=\"true\">·</span>미분류 {unfiled_n}</span>")
+    } else {
+        String::new()
+    };
     let day_max = daily.iter().map(|d| d.1).max().unwrap_or(0);
     let week_views: i64 = daily.iter().map(|d| d.1).sum();
     let bars: String = daily
@@ -738,12 +742,12 @@ pub async fn index(
     };
     let stats = format!(
         "<dl class=\"stats\">\
-         <div><dt>전체 문서</dt><dd>{total}</dd><span class=\"sub\"><span>프로젝트 {named}개{unfiled_note}</span></span></div>\
-         <div class=\"with-spark\"><div><dt><span class=\"long\">최근 </span>7일 열람된 문서</dt><dd>{viewed}<small> / {total}</small></dd>\
-         <span class=\"sub\"><span>열람 {week_views}회</span></span></div>\
-         <div><div class=\"spark\" role=\"img\" aria-label=\"최근 7일 하루별 열람 수\">{bars}</div>\
-         <div class=\"spark-axis\"><span>{first_day}</span><span>오늘</span></div></div></div>\
-         <div><dt>내가 올린 문서</dt><dd>{mine_n}</dd><span class=\"sub\">{mine_link}</span></div></dl>",
+         <div><dt>전체 문서</dt><dd>{total}<span class=\"sub\"><span>프로젝트 {named}개{unfiled_note}</span></span></dd></div>\
+         <div class=\"with-spark\"><dt><span class=\"long\">최근 </span>7일 열람된 문서</dt><dd>{viewed}<small> / {total}</small>\
+         <span class=\"sub\"><span>열람 {week_views}회</span></span>\
+         <span class=\"spark-box\"><span class=\"spark\" role=\"img\" aria-label=\"최근 7일 하루별 열람 수\">{bars}</span>\
+         <span class=\"spark-axis\"><span>{first_day}</span><span>오늘</span></span></span></dd></div>\
+         <div><dt>내가 올린 문서</dt><dd>{mine_n}<span class=\"sub\">{mine_link}</span></dd></div></dl>",
         total = sum.total,
         viewed = sum.viewed,
         mine_n = sum.mine,
@@ -893,11 +897,19 @@ pub async fn index(
              <noscript><button>적용</button></noscript></form><span>열람</span><span>댓글</span><span></span></div>\
              <table><thead><tr>{}<th>프로젝트</th>{}{}{}\
              <th><span class=\"visually-hidden\">작업</span></th></tr></thead><tbody>{rows}</tbody></table>\
-             <div class=\"board-foot\"><span>{shown} 문서, {scope}</span>{pager}</div></div>",
+             <div class=\"board-foot{}\"><span>{scope}, {}</span>{pager}</div></div>",
             sorted(Sort::Title, "제목", ""),
             sorted(Sort::Recent, "올린 사람, 시각", ""),
             sorted(Sort::Views, "7일 열람", " class=\"num\""),
             sorted(Sort::Comments, "댓글", " class=\"num\""),
+            // 아무 조건도 없을 때는 휴대폰에서 이 줄을 숨긴다 (목록 머리의 정렬과 겹친다).
+            if filtering { "" } else { " plain" },
+            match sort {
+                Sort::Recent => "최근 올린 순",
+                Sort::Views => "많이 본 순",
+                Sort::Comments => "댓글 많은 순",
+                Sort::Title => "제목 순",
+            },
         )
     };
 
@@ -950,10 +962,10 @@ pub async fn index(
              <p class=\"lede\">팀이 Claude로 만든 HTML 결과물을 링크로 열고 찾습니다.</p></div>\
              <a class=\"btn\" href=\"/upload\">HTML 올리기</a></div>\
              <form class=\"search\" method=\"get\" action=\"/\" role=\"search\"><span class=\"mag\" aria-hidden=\"true\"></span>\
-             <input type=\"search\" id=\"q\" name=\"q\" value=\"{}\" placeholder=\"제목, 올린 사람, 본문으로 찾기\" aria-label=\"문서 찾기\">\
+             <input type=\"search\" id=\"q\" name=\"q\" aria-keyshortcuts=\"/\" value=\"{}\" placeholder=\"제목, 올린 사람, 본문으로 찾기\" aria-label=\"문서 찾기\">\
              <kbd aria-hidden=\"true\">/</kbd><button class=\"btn quiet sm\">찾기</button></form>\
              <div class=\"grid\"><section aria-label=\"문서\">{stats}{toolbar}{result_line}{board}</section>\
-             <aside class=\"side\"><section><h2>많이 본 문서<small>최근 7일</small></h2>{top}</section>\
+             <aside class=\"side\" aria-label=\"많이 본 문서와 최근 댓글\"><section><h2>많이 본 문서<small>최근 7일</small></h2>{top}</section>\
              <section><h2>최근 댓글<small>전체 {}개</small></h2>{recent}</section></aside></div>\
              <script>document.addEventListener('keydown',e=>{{if(e.key==='/'&&!/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)){{e.preventDefault();document.getElementById('q').focus()}}}})</script>",
             escape(&q),
@@ -1114,10 +1126,16 @@ fn doc_header(app: &AppState, doc: &Doc, here: &str) -> String {
         }
     };
     let project = if doc.project.is_empty() { "미분류".to_owned() } else { escape(&doc.project) };
+    let sep = "<span class=\"sep\" aria-hidden=\"true\">·</span>";
+    let crumb_project = if doc.project.is_empty() {
+        String::new()
+    } else {
+        format!(" / <a href=\"{}\">{project}</a>", escape(&list_url("", Some(&doc.project), false, Sort::Recent)))
+    };
     format!(
-        "<nav class=\"crumb\" aria-label=\"이동 경로\"><a href=\"/\">문서</a> /</nav>\
-         <div class=\"head\"><div><h1>{}</h1><p class=\"lede\">{project}, {}, {}, 7일 열람 {views}</p></div>\
-         <a class=\"btn\" href=\"/d/{id}\">문서 열기</a></div>\
+        "<nav class=\"crumb\" aria-label=\"이동 경로\"><a href=\"/\">문서</a>{crumb_project}</nav>\
+         <div class=\"head doc-head\"><div><h1>{}</h1><p class=\"lede\">{project}{sep}{}{sep}{}{sep}7일 열람 {views}</p></div>\
+         <a class=\"btn line\" href=\"/d/{id}\">문서 열기</a></div>\
          <nav class=\"tabs\" aria-label=\"문서 메뉴\">{}{}</nav>",
         escape(&doc.title),
         escape(&doc.uploader_name),
@@ -1287,9 +1305,9 @@ fn comments_page(app: &AppState, doc: &Doc, user: &crate::users::User, comments:
             &format!(
                 "{}<h2 class=\"visually-hidden\">댓글 {}개</h2>{list}\
                  <form class=\"reply\" method=\"post\" action=\"/d/{id}/comments\">{}\
-                 <label for=\"body\">댓글 남기기</label>\
+                 <label for=\"body\">댓글</label>\
                  <textarea id=\"body\" name=\"body\" rows=\"4\" maxlength=\"{MAX_COMMENT}\" required></textarea>\
-                 <div class=\"reply-foot\"><span class=\"hint\">{MAX_COMMENT}자까지. 쓴 사람과 관리자만 지울 수 있습니다.</span>\
+                 <div class=\"reply-foot\"><span class=\"hint\">2,000자까지. 쓴 사람과 관리자만 지울 수 있습니다.</span>\
                  <button class=\"btn\">댓글 남기기</button></div></form>",
                 doc_header(app, doc, "댓글"),
                 comments.len(),
@@ -1332,7 +1350,7 @@ pub async fn comment_add(
         return comments_page(&app, &doc, &user, &list(), "댓글 내용을 입력해 주세요.");
     }
     if body.chars().count() > MAX_COMMENT {
-        return comments_page(&app, &doc, &user, &list(), "댓글은 2000자 이하로 입력해 주세요.");
+        return comments_page(&app, &doc, &user, &list(), "댓글은 2,000자 이하로 입력해 주세요.");
     }
     match app.docs.add_comment(&id, &user, body) {
         Ok(()) => Redirect::to(&format!("/d/{id}/comments")).into_response(),

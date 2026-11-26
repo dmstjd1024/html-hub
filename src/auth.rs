@@ -94,8 +94,8 @@ pub(crate) fn escape(s: &str) -> String {
 
 // 숲색 메뉴 띠 하나만 눈에 띄게 두고 나머지는 조용하게. 다크 모드는 시스템 설정을 따른다.
 const CSS: &str = r#"
-:root{--bg:#F5F5F1;--surface:#FFFFFF;--ink:#1D2622;--ink-2:#5B655F;--ink-3:#8A938D;--line:#E3E5DF;--line-2:#EEF0EB;--forest:#1F3B2D;--leaf:#2F6B4F;--leaf-ink:#2F6B4F;--on-leaf:#FFFFFF;--track:#E6EBE6;--tag:#EEF2EE;--alert:#B3261E;--alert-bg:#FBEAE8;color-scheme:light}
-@media (prefers-color-scheme:dark){.rail{border-right:1px solid #252D28}:root{--bg:#121815;--surface:#18201C;--ink:#E4EAE6;--ink-2:#A3AEA8;--ink-3:#77837C;--line:#2A3430;--line-2:#222B27;--forest:#16241C;--leaf:#5FA67F;--leaf-ink:#8FCBA8;--on-leaf:#0C1A12;--track:#26302B;--tag:#22302A;--alert:#F2B8B5;--alert-bg:#3A1F1D;color-scheme:dark}}
+:root{--bg:#F5F5F1;--surface:#FFFFFF;--ink:#1D2622;--ink-2:#5B655F;--ink-3:#646D67;--line:#E3E5DF;--line-strong:#C9CEC6;--line-2:#EEF0EB;--forest:#1F3B2D;--leaf:#2F6B4F;--leaf-ink:#2F6B4F;--on-leaf:#FFFFFF;--track:#E6EBE6;--tag:#EEF2EE;--alert:#B3261E;--alert-bg:#FBEAE8;color-scheme:light}
+@media (prefers-color-scheme:dark){.rail{border-right:1px solid #252D28}:root{--bg:#121815;--surface:#18201C;--ink:#E4EAE6;--ink-2:#A3AEA8;--ink-3:#909C95;--line:#2A3430;--line-strong:#3A463F;--line-2:#222B27;--forest:#16241C;--leaf:#5FA67F;--leaf-ink:#8FCBA8;--on-leaf:#0C1A12;--track:#26302B;--tag:#22302A;--alert:#F2B8B5;--alert-bg:#3A1F1D;color-scheme:dark}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 "IBM Plex Sans KR",system-ui,-apple-system,"Apple SD Gothic Neo",sans-serif;font-variant-numeric:tabular-nums;word-break:keep-all;overflow-wrap:anywhere}
 a{color:var(--leaf-ink)}
@@ -134,6 +134,7 @@ time{white-space:nowrap}
 .btn{display:inline-block;background:var(--leaf);color:var(--on-leaf);border:0;border-radius:6px;padding:9px 16px;font:inherit;font-weight:500;text-decoration:none;cursor:pointer;white-space:nowrap;min-height:40px}
 .btn:hover{filter:brightness(1.07)}
 .btn.quiet{background:var(--tag);color:var(--ink);font-weight:500}
+.btn.line{background:transparent;border:1px solid var(--line-strong);color:var(--ink)}
 .btn.sm{padding:6px 12px;min-height:36px;font-size:14px}
 .link{background:none;border:0;padding:0;font:inherit;color:var(--leaf-ink);cursor:pointer;text-decoration:none}
 .link:hover{text-decoration:underline}
@@ -147,11 +148,13 @@ input[type=file]::file-selector-button{height:32px;padding:0 12px;margin:0 12px 
 .field label{display:block;font-weight:500;margin-bottom:6px}
 .field .hint{display:block;color:var(--ink-2);font-size:13px;margin-top:4px}
 .error{color:var(--alert);background:var(--alert-bg);border-radius:6px;padding:10px 14px;margin:0 0 18px}
-.search{display:flex;align-items:center;gap:10px;min-height:48px;background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:5px 5px 5px 14px;margin-bottom:16px}
+.search{display:flex;align-items:center;gap:10px;height:48px;background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:0 6px 0 14px;margin-bottom:16px}
+.search .btn{height:36px;min-height:0;padding:0 14px;line-height:36px}
+.doc-head{max-width:720px}
 .mag{position:relative;flex:none;width:14px;height:14px;border:2px solid var(--ink-3);border-radius:50%}
 .mag::after{content:"";position:absolute;width:6px;height:2px;background:var(--ink-3);right:-5px;bottom:-3px;transform:rotate(45deg);border-radius:1px}
 .search:focus-within{border-color:var(--leaf-ink);outline:2px solid var(--leaf-ink);outline-offset:2px}
-.search input{border:0;padding:6px 0;background:none;outline:none}
+.search input{border:0;padding:0;height:36px;background:none;outline:none}
 .search kbd{font:inherit;font-size:12px;color:var(--ink-3);border:1px solid var(--line);border-radius:4px;padding:0 6px}
 .grid{display:grid;grid-template-columns:minmax(0,1fr) 280px;gap:28px;align-items:start}
 .stats{display:grid;grid-template-columns:1fr 1.1fr 1fr;background:var(--surface);border:1px solid var(--line);border-radius:10px;margin:0 0 16px}
@@ -160,15 +163,16 @@ input[type=file]::file-selector-button{height:32px;padding:0 12px;margin:0 12px 
 .stats dt{font-size:13px;color:var(--ink-2)}
 .stats dd{margin:2px 0 0;font-size:28px;font-weight:600;line-height:1.2}
 .stats dd small{font-size:15px;font-weight:400;color:var(--ink-3)}
-.stats .sub{display:block;font-size:12px;color:var(--ink-2);margin-top:4px}
+.stats .sub{display:block;font-size:12px;font-weight:400;line-height:1.5;color:var(--ink-2);margin-top:4px}
 .stats .sub a{text-decoration:none;font-weight:500}
-.stats .with-spark{display:flex;justify-content:space-between;align-items:flex-end;gap:12px}
+.stats .with-spark{position:relative}
+.spark-box{position:absolute;right:18px;bottom:14px}
 .spark{display:grid;grid-template-columns:repeat(7,7px);gap:4px;align-items:end;height:30px}
 .spark span{display:block;background:var(--track);border-radius:2px}
 .spark span:not(.on){height:2px!important}
 .spark span.on{background:var(--leaf);opacity:.55}
 .spark span.today{opacity:1}
-.spark-axis{display:flex;justify-content:space-between;font-size:11px;color:var(--ink-3);margin-top:2px}
+.spark-axis{display:flex;justify-content:space-between;font-size:11px;font-weight:400;line-height:1.4;color:var(--ink-3);margin-top:2px}
 .toolbar{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px}
 .chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:20px}
 .toolbar .chips{margin-bottom:0}
@@ -184,6 +188,7 @@ input[type=file]::file-selector-button{height:32px;padding:0 12px;margin:0 12px 
 th{text-align:left;font-size:12px;font-weight:500;color:var(--ink-2);padding:10px 12px;border-bottom:1px solid var(--line);white-space:nowrap}
 td{padding:7px 12px;height:52px;line-height:1.35;border-bottom:1px solid var(--line-2);vertical-align:middle}
 .zero{color:var(--ink-3)}
+.sep{color:var(--ink-3);margin:0 6px}
 tbody tr:last-child td{border-bottom:0}
 th.num,td.num{text-align:right}
 .sort-link{color:inherit;text-decoration:none}
@@ -225,7 +230,7 @@ td.t{width:40%;max-width:0}
 .cmts b{font-weight:500}
 .cmts time{font-size:12px;color:var(--ink-3);margin-left:4px}
 .cmts p{margin:2px 0;color:var(--ink);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-.cmts a{font-size:12px;text-decoration:none}
+.cmts a{display:block;font-size:12px;text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .cmts a:hover{text-decoration:underline}
 .quiet{color:var(--ink-2);font-size:14px;margin:10px 0 0}
 .empty{padding:28px 18px;color:var(--ink-2);margin:0}
@@ -285,14 +290,15 @@ pre{background:var(--tag);border-radius:6px;padding:12px 14px;overflow-x:auto;fo
 .head{margin-bottom:12px}
 .head .btn,.head .lede{display:none}
 .stats{grid-template-columns:repeat(3,1fr)}
-.stats>div{padding:10px 12px;display:flex;flex-direction:column;justify-content:space-between}
+.stats>div{padding:10px 12px;display:flex;flex-direction:column;justify-content:flex-start}
 .stats dt{font-size:12px;line-height:1.4}
 .stats dt .long{display:none}
 .stats dd{font-size:22px}
-.stats .sub span,.stats .spark-axis{display:none}
-.stats .with-spark{flex-direction:column;align-items:stretch;justify-content:space-between}
+.stats .with-spark .sub,.stats .spark-axis{display:none}
+.spark-box{position:static;display:block}
 .spark{grid-template-columns:repeat(7,5px);gap:2px;height:17px;margin-top:4px}
-.toolbar .sort,.search kbd{display:none}
+.toolbar .sort,.search kbd,.board-foot.plain>span,.unfiled-note{display:none}
+.board-foot.plain:not(:has(.pager)){display:none}
 .chips{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;padding-bottom:4px}
 .chips::-webkit-scrollbar{display:none}
 .mhead{display:grid;grid-template-columns:minmax(0,1fr) 32px 32px 44px;align-items:center;gap:0 8px;padding:6px 4px 6px 14px;border-bottom:1px solid var(--line);font-size:13px;color:var(--ink-2)}
@@ -303,7 +309,7 @@ pre{background:var(--tag);border-radius:6px;padding:12px 14px;overflow-x:auto;fo
 .board tr{display:grid;grid-template-columns:auto minmax(0,1fr) 32px 32px 44px;grid-template-areas:"t t v c m" "g b v c m";gap:2px 8px;align-items:center;padding:10px 4px 10px 14px;border-bottom:1px solid var(--line-2)}
 .board td{display:block;border:0;padding:0;height:auto;font-size:13px}
 .board td.t{grid-area:t;width:auto;max-width:none;font-size:15px}
-.board td.t .doc-title{white-space:normal}
+.board td.t .doc-title{white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
 .board td.g{grid-area:g}
 .board td.by{grid-area:b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink-2)}
 .board .by time{display:inline;margin-left:6px}
@@ -338,7 +344,7 @@ fn document(body: &str) -> Html<String> {
 
 /// 로그인 없이 보이거나 혼자 떠 있는 안내 화면 (오류, 로그아웃, 약관).
 pub(crate) fn page(body: &str) -> Html<String> {
-    document(&format!("<main class=\"sheet\"><a class=\"brand\" href=\"/\">html-hub</a><div>{body}</div></main>"))
+    document(&format!("<main class=\"sheet\"><h1 class=\"visually-hidden\">html-hub 안내</h1><a class=\"brand\" href=\"/\">html-hub</a><div>{body}</div></main>"))
 }
 
 /// 로그인한 직원이 보는 화면. 왼쪽 메뉴 띠(휴대폰에서는 위쪽 줄)에 현재 위치와 문서 수를 표시한다.
@@ -365,7 +371,7 @@ pub(crate) fn shell(app: &AppState, user: &User, current: &str, body: &str) -> H
          <details class=\"menu\"><summary aria-label=\"내 계정\"><span class=\"avatar\">{initial}</span></summary>\
          <div><div class=\"me\">{name}<br>{email}{logout}</div></div></details></header>\
          <nav class=\"mtabs\" aria-label=\"메뉴\">{nav}</nav>\
-         <div class=\"app\"><aside class=\"rail\"><a class=\"brand\" href=\"/\">html-hub<small>Greenery</small></a>\
+         <div class=\"app\"><aside class=\"rail\" aria-label=\"사이드 메뉴\"><a class=\"brand\" href=\"/\">html-hub<small>Greenery</small></a>\
          <nav aria-label=\"메뉴\">{nav}</nav>\
          <div class=\"who\"><span class=\"avatar\">{initial}</span><div><b>{name}</b><small>{email}</small></div>{logout}</div></aside>\
          <main class=\"main\">{body}</main></div>"
