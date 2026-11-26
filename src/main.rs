@@ -87,6 +87,8 @@ async fn main() -> Result<()> {
         .route("/uploaded/{id}", get(docs::uploaded))
         .route("/d/{id}", get(docs::view))
         .route("/d/{id}/delete", post(docs::delete))
+        .route("/d/{id}/unhide", post(docs::unhide))
+        .route("/admin/hidden", get(docs::hidden_list))
         .route("/d/{id}/history", get(docs::history))
         .route("/d/{id}/comments", get(docs::comments_view).post(docs::comment_add))
         .route("/d/{id}/comments/{cid}/delete", post(docs::comment_delete))

@@ -316,6 +316,26 @@ impl Docs {
         Ok(())
     }
 
+    /// 숨긴 문서를 최근에 숨긴 것부터 (D4-1, 관리자 화면용).
+    pub fn hidden(&self) -> Result<Vec<Doc>> {
+        let conn = self.db.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, project, uploader_email, uploader_name, created_at
+             FROM documents WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC, rowid DESC",
+        )?;
+        let rows = stmt.query_map([], row_to_doc)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// 숨긴 문서를 되살린다. 숨겨져 있지 않았으면 false.
+    pub fn unhide(&self, id: &str) -> Result<bool> {
+        let n = self.db.lock().unwrap().execute(
+            "UPDATE documents SET deleted_at = NULL WHERE id = ?1 AND deleted_at IS NOT NULL",
+            [id],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn record_view(&self, id: &str) -> Result<()> {
         self.db
             .lock()
@@ -487,7 +507,7 @@ pub async fn index(
     let empty = if docs.is_empty() { "<p>문서가 없습니다.</p>" } else { "" };
 
     page(&format!(
-        "<p>{}님, 안녕하세요. <a href=\"/upload\">올리기</a> <a href=\"/tokens\">토큰</a> \
+        "<p>{}님, 안녕하세요. <a href=\"/upload\">올리기</a> <a href=\"/tokens\">토큰</a> {admin}\
          <form method=\"post\" action=\"/logout\" style=\"display:inline\"><button>로그아웃</button></form></p>\
          <form method=\"get\" action=\"/\">\
          <input name=\"q\" value=\"{}\" placeholder=\"제목, 올린 사람, 본문\"> \
@@ -496,6 +516,7 @@ pub async fn index(
          <table><tr><th>제목</th><th>프로젝트</th><th>올린 사람</th><th>올린 시각</th><th></th></tr>{rows}</table>{empty}{nav}",
         escape(&user.name),
         escape(&q),
+        admin = if user.is_admin() { "<a href=\"/admin/hidden\">숨긴 문서</a> " } else { "" },
     ))
     .into_response()
 }
@@ -921,6 +942,57 @@ pub async fn delete(State(app): State<AppState>, jar: PrivateCookieJar, Path(id)
     }
 }
 
+fn admin_only() -> Response {
+    (StatusCode::FORBIDDEN, page("관리자만 할 수 있습니다. <a href=\"/\">목록으로</a>")).into_response()
+}
+
+/// 숨긴 문서 목록 (정책서 D4-1: 살리는 일은 관리자만).
+pub async fn hidden_list(State(app): State<AppState>, jar: PrivateCookieJar) -> Response {
+    match current_user(&app, &jar) {
+        Ok(u) if u.is_admin() => {}
+        Ok(_) => return admin_only(),
+        Err(r) => return r,
+    }
+    let docs = match app.docs.hidden() {
+        Ok(d) => d,
+        Err(e) => return server_error("숨긴 문서 조회", e),
+    };
+    let rows: String = docs
+        .iter()
+        .map(|d| {
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>\
+                 <form method=\"post\" action=\"/d/{id}/unhide\" style=\"display:inline\"><button>살리기</button></form></td></tr>",
+                escape(&d.title),
+                if d.project.is_empty() { "미분류".into() } else { escape(&d.project) },
+                escape(&d.uploader_name),
+                show_time(d.created_at),
+                id = escape(&d.id),
+            )
+        })
+        .collect();
+    let empty = if docs.is_empty() { "<p>숨긴 문서가 없습니다.</p>" } else { "" };
+    page(&format!(
+        "<h1>숨긴 문서</h1><p>살리면 목록과 검색에 다시 나오고 링크도 열립니다.</p>\
+         <table><tr><th>제목</th><th>프로젝트</th><th>올린 사람</th><th>올린 시각</th><th></th></tr>{rows}</table>{empty}\
+         <p><a href=\"/\">목록으로</a></p>"
+    ))
+    .into_response()
+}
+
+pub async fn unhide(State(app): State<AppState>, jar: PrivateCookieJar, Path(id): Path<String>) -> Response {
+    match current_user(&app, &jar) {
+        Ok(u) if u.is_admin() => {}
+        Ok(_) => return admin_only(),
+        Err(r) => return r,
+    }
+    match app.docs.unhide(&id) {
+        Ok(true) => Redirect::to("/admin/hidden").into_response(),
+        Ok(false) => not_found(),
+        Err(e) => server_error("문서 살리기", e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1088,6 +1160,24 @@ mod tests {
         let second = d.list("", "", PAGE_SIZE).unwrap();
         assert_eq!(second.len(), 3);
         assert_eq!(second[2].title, "문서0");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn 숨긴_문서만_따로_보이고_살리면_목록으로_돌아온다() {
+        let (d, dir) = docs();
+        let a = user("a@x.im", "가나");
+        let id = d.insert("되살릴 것", "A", &a, "<p>본문글</p>".as_bytes()).unwrap();
+        d.insert("그대로", "A", &a, b"x").unwrap();
+        assert!(d.hidden().unwrap().is_empty());
+        d.hide(&id).unwrap();
+        assert_eq!(d.hidden().unwrap()[0].title, "되살릴 것");
+        assert!(d.unhide(&id).unwrap());
+        assert!(d.hidden().unwrap().is_empty());
+        assert!(d.get(&id).unwrap().is_some());
+        assert_eq!(d.list("본문글", "", 0).unwrap().len(), 1, "본문 검색에도 다시 걸린다");
+        assert!(!d.unhide(&id).unwrap(), "숨기지 않은 문서는 바뀌지 않는다");
+        assert!(!d.unhide("없는번호").unwrap());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
