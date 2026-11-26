@@ -186,6 +186,8 @@ td{padding:7px 12px;height:52px;line-height:1.35;border-bottom:1px solid var(--l
 .zero{color:var(--ink-3)}
 tbody tr:last-child td{border-bottom:0}
 th.num,td.num{text-align:right}
+.sort-link{color:inherit;text-decoration:none}
+.sort-link:hover{color:var(--ink);text-decoration:underline}
 td.num{white-space:nowrap}
 td.t{width:40%;max-width:0}
 .doc-title{display:block;color:var(--ink);font-weight:500;text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

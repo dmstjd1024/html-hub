@@ -870,9 +870,14 @@ pub async fn index(
     } else {
         String::new()
     };
+    // 머리글을 누르면 그 기준으로 정렬한다. 지금 기준은 화살표와 aria-sort 로 알린다.
     let sorted = |s: Sort, label: &str, class: &str| {
-        let arrow = if s == sort { if s == Sort::Title { " ↑" } else { " ↓" } } else { "" };
-        format!("<th{class}>{label}{arrow}</th>")
+        let (arrow, aria) = if s == sort {
+            if s == Sort::Title { (" ↑", " aria-sort=\"ascending\"") } else { (" ↓", " aria-sort=\"descending\"") }
+        } else {
+            ("", "")
+        };
+        format!("<th{class}{aria}><a class=\"sort-link\" href=\"{}\">{label}{arrow}</a></th>", escape(&list_url(&q, project, mine, s)))
     };
     let board = if docs.is_empty() {
         let msg = if filtering {

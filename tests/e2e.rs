@@ -714,7 +714,8 @@ async fn 대시보드는_요약_숫자와_많이_본_문서와_최근_댓글을_
     assert_eq!(listed_titles(&s.get("/?sort=comments", Some(&owner)).await.body), ["가끔 보는 메모", "자주 보는 보고서"]);
     let by_title = s.get("/?sort=title", Some(&owner)).await.body;
     assert_eq!(listed_titles(&by_title), ["가끔 보는 메모", "자주 보는 보고서"]);
-    assert!(by_title.contains("<option value=\"title\" selected>제목 순</option>") && by_title.contains("<th>제목 ↑</th>"));
+    assert!(by_title.contains("<option value=\"title\" selected>제목 순</option>") && by_title.contains("<th aria-sort=\"ascending\"><a class=\"sort-link\" href=\"/?sort=title\">제목 ↑</a></th>"));
+    assert!(r.contains("<a class=\"sort-link\" href=\"/?sort=views\">7일 열람</a>"), "머리글을 눌러 정렬");
 
     // 숨긴 문서는 숫자와 패널에서 빠진다.
     s.post(&format!("/d/{hot}/delete"), Some(&owner), &[]).await;
