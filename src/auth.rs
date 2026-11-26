@@ -148,7 +148,8 @@ pub async fn login(
         app.secure_cookies,
         OAUTH_COOKIE,
         serde_json::to_string(&pending).unwrap(),
-        Duration::minutes(10),
+        // 구글 비밀번호·2단계 인증이 길어져도 끊기지 않게 30분 (10분일 때 만료 안내가 떴다).
+        Duration::minutes(30),
     );
     (jar.add(c), Redirect::to(url.as_str()))
 }
