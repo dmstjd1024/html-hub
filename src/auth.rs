@@ -92,11 +92,161 @@ pub(crate) fn escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-pub(crate) fn page(body: &str) -> Html<String> {
+// 숲색 메뉴 띠 하나만 눈에 띄게 두고 나머지는 조용하게. 다크 모드는 시스템 설정을 따른다.
+const CSS: &str = r#"
+:root{--paper:#F6F7F4;--surface:#FFFFFF;--ink:#1D2622;--ink-2:#55605A;--forest:#1F3B2D;--leaf:#2F6B4F;--on-leaf:#FFFFFF;--moss:#E3ECE5;--line:#D5DBD6;--alert:#B3261E;--alert-bg:#FBEAE8;color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--paper:#121A16;--surface:#18231D;--ink:#E4EAE6;--ink-2:#9AA6A0;--forest:#0C1A12;--leaf:#86C9A1;--on-leaf:#0C1A12;--moss:#1D2C24;--line:#2B3A31;--alert:#F2B8B5;--alert-bg:#3A1F1D;color-scheme:dark}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.6 "IBM Plex Sans KR",system-ui,-apple-system,"Apple SD Gothic Neo",sans-serif;font-variant-numeric:tabular-nums}
+a{color:var(--leaf)}
+:focus-visible{outline:2px solid var(--leaf);outline-offset:2px;border-radius:4px}
+h1{font-size:24px;font-weight:600;line-height:1.3;margin:0 0 4px}
+h2{font-size:15px;font-weight:600;margin:0 0 10px}
+.lede{color:var(--ink-2);margin:0}
+.app{display:grid;grid-template-columns:216px minmax(0,1fr);min-height:100vh}
+.rail{background:var(--forest);color:#C9D8CE;padding:24px 14px;display:flex;flex-direction:column;position:sticky;top:0;height:100vh}
+.rail .brand{color:#fff;font-weight:600;font-size:18px;text-decoration:none;padding:0 10px;margin-bottom:28px}
+.rail nav{display:flex;flex-direction:column;gap:2px}
+.rail nav a{color:#C9D8CE;text-decoration:none;padding:8px 10px;border-radius:6px}
+.rail nav a:hover{color:#fff;background:rgba(255,255,255,.06)}
+.rail nav a[aria-current=page]{color:#fff;background:rgba(255,255,255,.13);font-weight:500}
+.rail .group{font-size:12px;color:#8FA698;padding:16px 10px 4px}
+.rail .who{margin-top:auto;padding:12px 10px 0;border-top:1px solid rgba(255,255,255,.12);font-size:13px}
+.rail .who b{display:block;color:#fff;font-weight:500}
+.rail .who button{background:none;border:0;padding:0;margin-top:6px;color:#C9D8CE;font:inherit;text-decoration:underline;cursor:pointer}
+.main{padding:32px 40px 48px;max-width:1240px;width:100%}
+.top{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;margin-bottom:24px}
+.btn{display:inline-block;background:var(--leaf);color:var(--on-leaf);border:0;border-radius:6px;padding:9px 16px;font:inherit;font-weight:500;text-decoration:none;cursor:pointer;white-space:nowrap}
+.btn:hover{filter:brightness(1.08)}
+.link{background:none;border:0;padding:0;font:inherit;color:var(--leaf);cursor:pointer;text-decoration:none}
+.link:hover{text-decoration:underline}
+.link.danger{color:var(--alert)}
+input[type=text],input[type=search],input:not([type]),input[type=file],textarea,select{font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:9px 12px;width:100%}
+textarea{resize:vertical}
+.field{margin:0 0 18px}
+.field label{display:block;font-weight:500;margin-bottom:6px}
+.field .hint{display:block;color:var(--ink-2);font-size:13px;margin-top:4px}
+.error{color:var(--alert);background:var(--alert-bg);border-radius:6px;padding:10px 14px;margin:0 0 18px}
+.figures{display:flex;flex-wrap:wrap;gap:12px 48px;margin:0 0 28px}
+.figures div{margin:0}
+.figures dt{font-size:13px;color:var(--ink-2)}
+.figures dd{margin:0;font-size:28px;font-weight:600;line-height:1.2}
+.search{display:flex;gap:8px;margin-bottom:12px}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:24px}
+.chips a{font-size:13px;padding:4px 12px;border-radius:999px;background:var(--moss);color:var(--ink);text-decoration:none}
+.chips a[aria-current=true]{background:var(--leaf);color:var(--on-leaf)}
+.chips span{font-size:13px;padding:4px 12px;border-radius:999px;background:var(--leaf);color:var(--on-leaf)}
+.result{color:var(--ink-2);font-size:14px;margin:-8px 0 8px}
+.narrow{max-width:760px}
+.comments{max-width:760px}
+.grid{display:grid;grid-template-columns:minmax(0,1fr) 272px;gap:32px;align-items:start}
+.doc-table td:first-child{min-width:200px}
+.table-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;font-size:13px;font-weight:500;color:var(--ink-2);padding:8px 12px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:12px;border-bottom:1px solid var(--line);vertical-align:top}
+td.num,th.num{text-align:right}
+td.num{color:var(--ink-2)}
+td.when{white-space:nowrap;color:var(--ink-2);font-size:14px}
+.doc-title{color:var(--ink);font-weight:500;text-decoration:none}
+.doc-title:hover{color:var(--leaf);text-decoration:underline}
+.excerpt{display:block;font-size:13px;color:var(--ink-2);margin-top:4px}
+.tag{display:inline-block;font-size:13px;background:var(--moss);border-radius:4px;padding:1px 8px;white-space:nowrap}
+.tag.none{background:none;color:var(--ink-2);padding:0}
+.actions{white-space:nowrap;font-size:14px}
+.actions a,.actions .link{margin-right:12px;color:var(--ink-2);text-decoration:none}
+.actions a:hover,.actions .link:hover{color:var(--leaf);text-decoration:underline}
+.actions .link.danger{color:var(--alert)}
+.panel a{color:var(--ink);font-weight:500;text-decoration:none}
+.panel a:hover{color:var(--leaf);text-decoration:underline}
+time{white-space:nowrap}
+.actions form{display:inline}
+.pager{display:flex;gap:12px;align-items:center;margin-top:16px;color:var(--ink-2)}
+.pager form{display:inline}
+.pager button{font:inherit;background:var(--surface);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:6px 14px;cursor:pointer}
+.panel{background:var(--moss);border-radius:8px;padding:16px 18px;margin-bottom:16px}
+.panel ol,.panel ul{list-style:none;margin:0;padding:0}
+.panel li{padding:7px 0;border-top:1px solid var(--line);font-size:14px}
+.panel li:first-child{border-top:0}
+.panel .meta{display:block;color:var(--ink-2);font-size:13px}
+.panel .quiet{color:var(--ink-2);font-size:14px;margin:0}
+.empty{padding:28px 0;color:var(--ink-2)}
+.sheet{max-width:640px;margin:12vh auto;padding:28px 32px 32px;background:var(--surface);border-radius:10px;font-size:16px}
+.sheet .brand{display:inline-block;color:var(--leaf);font-weight:600;text-decoration:none;margin-bottom:16px}
+.form{max-width:560px}
+.copy{display:flex;gap:8px;margin:16px 0;max-width:760px}
+.comments{list-style:none;padding:0;margin:0 0 24px}
+.comments li{padding:14px 0;border-bottom:1px solid var(--line)}
+.comments .body{white-space:pre-wrap;margin-top:4px}
+.comments .meta{color:var(--ink-2);font-size:13px}
+.visually-hidden{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+pre{background:var(--moss);border-radius:6px;padding:12px 14px;overflow-x:auto;font-size:13px}
+@media (max-width:1360px){.grid{grid-template-columns:minmax(0,1fr)}.grid aside{display:grid;grid-template-columns:1fr 1fr;gap:16px}.grid aside .panel{margin:0}}
+@media (max-width:1000px){
+.doc-table thead{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+.doc-table,.doc-table tbody,.doc-table tr{display:block}
+.doc-table tr{padding:14px 0;border-bottom:1px solid var(--line)}
+.doc-table td{display:inline-block;border:0;padding:2px 14px 2px 0;font-size:14px}
+.doc-table td:first-child{min-width:0;display:block;font-size:15px;padding-bottom:6px}
+.doc-table td.num{text-align:left}
+.doc-table td.num::before{content:attr(data-label) " ";color:var(--ink-2)}
+.doc-table td.actions{display:block;padding-top:6px}
+}
+@media (max-width:860px){
+.grid aside{grid-template-columns:1fr}
+.app{grid-template-columns:1fr}
+.rail{position:static;height:auto;flex-direction:row;flex-wrap:wrap;align-items:center;gap:4px 8px;padding:12px 16px}
+.rail .brand{margin:0 8px 0 0;padding:0}
+.rail nav{flex-direction:row;flex-wrap:wrap}
+.rail .group{display:none}
+.rail .who{margin:0 0 0 auto;padding:0;border:0}
+.rail .who b{display:inline;margin-right:8px}
+.rail .who .email{display:none}
+.main{padding:20px 16px 40px}
+.grid{grid-template-columns:1fr}
+.figures dd{font-size:22px}
+}
+"#;
+
+fn document(body: &str) -> Html<String> {
     Html(format!(
         "<!doctype html><html lang=\"ko\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-         <title>html-hub</title></head><body>{body}</body></html>"
+         <title>html-hub</title>\
+         <link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">\
+         <link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>\
+         <link rel=\"stylesheet\" href=\"https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+KR:wght@400;500;600&display=swap\">\
+         <style>{CSS}</style></head><body>{body}</body></html>"
+    ))
+}
+
+/// 로그인 없이 보이거나 혼자 떠 있는 안내 화면 (오류, 로그아웃, 약관).
+pub(crate) fn page(body: &str) -> Html<String> {
+    document(&format!("<main class=\"sheet\"><a class=\"brand\" href=\"/\">html-hub</a><div>{body}</div></main>"))
+}
+
+/// 로그인한 직원이 보는 화면. 왼쪽 메뉴 띠에 현재 위치를 표시한다.
+pub(crate) fn shell(user: &User, current: &str, body: &str) -> Html<String> {
+    let link = |href: &str, label: &str| {
+        let cur = if href == current { " aria-current=\"page\"" } else { "" };
+        format!("<a href=\"{href}\"{cur}>{label}</a>")
+    };
+    let admin = if user.is_admin() {
+        format!("<span class=\"group\">관리</span>{}{}", link("/admin/hidden", "숨긴 문서"), link("/admin/tokens", "토큰 관리"))
+    } else {
+        String::new()
+    };
+    document(&format!(
+        "<div class=\"app\"><aside class=\"rail\"><a class=\"brand\" href=\"/\">html-hub</a>\
+         <nav aria-label=\"메뉴\">{}{}{}{admin}</nav>\
+         <div class=\"who\"><b>{}</b><span class=\"email\">{}</span>\
+         <form method=\"post\" action=\"/logout\"><button>로그아웃</button></form></div></aside>\
+         <main class=\"main\">{body}</main></div>",
+        link("/", "문서"),
+        link("/upload", "올리기"),
+        link("/tokens", "내 토큰"),
+        escape(&user.name),
+        escape(&user.email),
     ))
 }
 

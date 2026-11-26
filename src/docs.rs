@@ -1,6 +1,6 @@
 use crate::{
     AppState,
-    auth::{current_user, current_user_next, escape, page},
+    auth::{current_user, current_user_next, escape, page, shell},
 };
 use anyhow::Result;
 use axum::{
@@ -29,6 +29,18 @@ pub struct Comment {
     pub body: String,
     pub created_at: i64,
 }
+
+/// 대시보드의 최근 댓글 한 줄.
+pub struct RecentComment {
+    pub doc_id: String,
+    pub doc_title: String,
+    pub by_name: String,
+    pub body: String,
+    pub created_at: i64,
+}
+
+/// 대시보드의 "지난 7일" 기준.
+const WEEK: i64 = 7 * 86400;
 
 pub struct Version {
     pub n: i64,
@@ -336,19 +348,77 @@ impl Docs {
         Ok(n > 0)
     }
 
-    /// 본문(현재 버전)에서 검색어가 처음 나오는 곳 앞 40자부터 120자. 본문에 없으면 None.
+    /// 본문(현재 버전)에서 검색어가 처음 나오는 곳 앞 40자부터 120자. 앞뒤가 잘렸으면 … 를 붙인다. 본문에 없으면 None.
     pub fn excerpt(&self, id: &str, q: &str) -> Result<Option<String>> {
         Ok(self
             .db
             .lock()
             .unwrap()
             .query_row(
-                "SELECT substr(text, max(instr(lower(text), lower(?2)) - 40, 1), 120)
-                 FROM bodies WHERE doc_id = ?1 AND instr(lower(text), lower(?2)) > 0",
+                "SELECT CASE WHEN s > 1 THEN '…' ELSE '' END || substr(text, s, 120)
+                        || CASE WHEN s + 120 <= length(text) THEN '…' ELSE '' END
+                 FROM (SELECT text, max(instr(lower(text), lower(?2)) - 40, 1) AS s
+                       FROM bodies WHERE doc_id = ?1 AND instr(lower(text), lower(?2)) > 0)",
                 params![id, q],
                 |r| r.get(0),
             )
             .optional()?)
+    }
+
+    /// 보이는 문서 수, 지난 7일 열람된 문서 수(북극성 지표), 이 사람이 올린 문서 수.
+    pub fn summary(&self, email: &str) -> Result<(i64, i64, i64)> {
+        Ok(self.db.lock().unwrap().query_row(
+            "SELECT (SELECT COUNT(*) FROM documents WHERE deleted_at IS NULL),
+                    (SELECT COUNT(DISTINCT v.doc_id) FROM views v JOIN documents d ON d.id = v.doc_id
+                      WHERE d.deleted_at IS NULL AND v.at >= ?2),
+                    (SELECT COUNT(*) FROM documents WHERE deleted_at IS NULL AND uploader_email = ?1)",
+            params![email, now_unix() - WEEK],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?)
+    }
+
+    /// 지난 7일 열람이 많은 문서 (번호, 제목, 열람 수).
+    pub fn top_viewed(&self, limit: i64) -> Result<Vec<(String, String, i64)>> {
+        let conn = self.db.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT d.id, d.title, COUNT(*) AS n FROM views v JOIN documents d ON d.id = v.doc_id
+             WHERE d.deleted_at IS NULL AND v.at >= ?1
+             GROUP BY d.id ORDER BY n DESC, MAX(v.at) DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![now_unix() - WEEK, limit], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// 최근 댓글. 지운 댓글과 숨긴 문서의 댓글은 뺀다.
+    pub fn recent_comments(&self, limit: i64) -> Result<Vec<RecentComment>> {
+        let conn = self.db.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT c.doc_id, d.title, c.by_name, c.body, c.created_at FROM comments c JOIN documents d ON d.id = c.doc_id
+             WHERE c.deleted_at IS NULL AND d.deleted_at IS NULL ORDER BY c.created_at DESC, c.id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], |r| {
+            Ok(RecentComment { doc_id: r.get(0)?, doc_title: r.get(1)?, by_name: r.get(2)?, body: r.get(3)?, created_at: r.get(4)? })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// 문서별 (지난 7일 열람 수, 댓글 수). 목록 한 쪽(최대 50개)에만 쓴다.
+    pub fn activity(&self, ids: &[String]) -> Result<std::collections::HashMap<String, (i64, i64)>> {
+        if ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let marks = vec!["?"; ids.len()].join(",");
+        let conn = self.db.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT d.id,
+                    (SELECT COUNT(*) FROM views v WHERE v.doc_id = d.id AND v.at >= ?1),
+                    (SELECT COUNT(*) FROM comments c WHERE c.doc_id = d.id AND c.deleted_at IS NULL)
+             FROM documents d WHERE d.id IN ({marks})"
+        ))?;
+        let mut args: Vec<rusqlite::types::Value> = vec![(now_unix() - WEEK).into()];
+        args.extend(ids.iter().map(|i| i.clone().into()));
+        let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn record_view(&self, id: &str) -> Result<()> {
@@ -422,6 +492,35 @@ pub fn show_time(unix: i64) -> String {
     format!("{} {:02}:{:02}", t.date(), t.hour(), t.minute())
 }
 
+/// "3시간 전" 처럼 읽기 쉬운 시각. 일주일이 넘으면 날짜로 보인다 (한국 시각).
+fn relative(unix: i64, now: i64) -> String {
+    let d = (now - unix).max(0);
+    match d {
+        0..60 => "방금".into(),
+        60..3600 => format!("{}분 전", d / 60),
+        3600..86400 => format!("{}시간 전", d / 3600),
+        86400..WEEK => format!("{}일 전", d / 86400),
+        _ => {
+            let kst = UtcOffset::from_hms(9, 0, 0).unwrap();
+            let (Ok(t), Ok(n)) = (OffsetDateTime::from_unix_timestamp(unix), OffsetDateTime::from_unix_timestamp(now)) else {
+                return String::new();
+            };
+            let (t, n) = (t.to_offset(kst), n.to_offset(kst));
+            let md = format!("{}월 {}일", u8::from(t.month()), t.day());
+            if t.year() == n.year() { md } else { format!("{}년 {md}", t.year()) }
+        }
+    }
+}
+
+/// 화면에 넣는 시각. 정확한 시각은 마우스를 올리면 보인다.
+pub fn when(unix: i64) -> String {
+    let iso = OffsetDateTime::from_unix_timestamp(unix)
+        .ok()
+        .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok())
+        .unwrap_or_default();
+    format!("<time datetime=\"{iso}\" title=\"{}\">{}</time>", show_time(unix), relative(unix, now_unix()))
+}
+
 /// 올린 HTML 을 내보내는 응답. sandbox 로 앱과 분리해 실행해서 문서 안의 JS 가 로그인 세션을 쓰지 못하게 한다 (정책서 S1).
 /// allow-same-origin 은 주지 않는다.
 fn document_response(bytes: Vec<u8>) -> Response {
@@ -483,28 +582,47 @@ pub async fn index(
             escape(&project),
         )
     };
-    let nav = format!(
-        "<div id=\"pages\">{}{}쪽 {}</div>",
-        if page_no > 1 { nav_button(page_no - 1, "이전") } else { String::new() },
-        page_no,
-        if has_next { nav_button(page_no + 1, "다음") } else { String::new() },
-    );
+    let pager = if page_no > 1 || has_next {
+        format!(
+            "<nav class=\"pager\" aria-label=\"쪽\">{}<span>{page_no}쪽</span>{}</nav>",
+            if page_no > 1 { nav_button(page_no - 1, "이전") } else { String::new() },
+            if has_next { nav_button(page_no + 1, "다음") } else { String::new() },
+        )
+    } else {
+        String::new()
+    };
 
-    let options: String = projects
-        .iter()
-        .map(|p| {
-            let sel = if *p == project { " selected" } else { "" };
-            format!("<option{sel}>{}</option>", escape(p))
-        })
+    // 프로젝트 칩은 검색어를 유지한 채 프로젝트만 바꾸는 링크다.
+    let enc = |s: &str| -> String { openidconnect::url::form_urlencoded::byte_serialize(s.as_bytes()).collect() };
+    let chip = |p: &str, label: &str| {
+        let mut params = Vec::new();
+        if !q.trim().is_empty() {
+            params.push(format!("q={}", enc(q.trim())));
+        }
+        if !p.is_empty() {
+            params.push(format!("project={}", enc(p)));
+        }
+        let href = if params.is_empty() { "/".to_owned() } else { format!("/?{}", params.join("&")) };
+        let cur = if p == project { " aria-current=\"true\"" } else { "" };
+        format!("<a href=\"{}\"{cur}>{}</a>", escape(&href), escape(label))
+    };
+    let chips: String = std::iter::once(chip("", "모든 프로젝트"))
+        .chain(projects.iter().map(|p| chip(p, p)))
         .collect();
+
+    let ids: Vec<String> = docs.iter().map(|d| d.id.clone()).collect();
+    // 열람·댓글 수와 옆 패널은 보조 정보라, 못 읽어도 목록은 보여 준다.
+    let activity = app.docs.activity(&ids).unwrap_or_default();
+    let (total, viewed, mine) = app.docs.summary(&user.email).unwrap_or_default();
     let rows: String = docs
         .iter()
         .map(|d| {
+            let id = escape(&d.id);
             let delete = if can_modify(&user, d) {
                 format!(
-                    "<form method=\"post\" action=\"/d/{}/delete\" style=\"display:inline\">\
-                     <button>삭제</button></form>",
-                    escape(&d.id)
+                    "<form method=\"post\" action=\"/d/{id}/delete\" \
+                     onsubmit=\"return confirm('이 문서를 목록에서 숨길까요? 관리자가 다시 살릴 수 있습니다.')\">\
+                     <button class=\"link danger\">삭제</button></form>"
                 )
             } else {
                 String::new()
@@ -513,38 +631,106 @@ pub async fn index(
             let excerpt = match q.trim() {
                 "" => String::new(),
                 t => match app.docs.excerpt(&d.id, t) {
-                    Ok(Some(e)) => format!("<br><small style=\"color:#666\">…{}…</small>", escape(&e)),
+                    Ok(Some(e)) => format!("<span class=\"excerpt\">{}</span>", escape(&e)),
                     _ => String::new(),
                 },
             };
+            let project = if d.project.is_empty() {
+                "<span class=\"tag none\">미분류</span>".to_owned()
+            } else {
+                format!("<span class=\"tag\">{}</span>", escape(&d.project))
+            };
+            let (views, comments) = activity.get(&d.id).copied().unwrap_or_default();
             format!(
-                "<tr><td><a href=\"/d/{id}\">{}</a>{excerpt}</td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"/d/{id}/history\">이력</a> <a href=\"/d/{id}/comments\">댓글</a> {delete}</td></tr>",
+                "<tr><td><a class=\"doc-title\" href=\"/d/{id}\">{}</a>{excerpt}</td><td>{project}</td><td>{}</td>\
+                 <td class=\"when\">{}</td><td class=\"num\" data-label=\"7일 열람\">{views}</td><td class=\"num\" data-label=\"댓글\">{comments}</td>\
+                 <td class=\"actions\"><a href=\"/d/{id}/history\">이력</a><a href=\"/d/{id}/comments\">댓글</a>{delete}</td></tr>",
                 escape(&d.title),
-                if d.project.is_empty() { "미분류".into() } else { escape(&d.project) },
                 escape(&d.uploader_name),
-                show_time(d.created_at),
-                id = escape(&d.id),
+                when(d.created_at),
             )
         })
         .collect();
-    let empty = if docs.is_empty() { "<p>문서가 없습니다.</p>" } else { "" };
+    let filtering = !q.trim().is_empty() || !project.is_empty();
+    let result_line = if filtering && !docs.is_empty() {
+        let n = if has_next || page_no > 1 { format!("{}개 넘게", PAGE_SIZE) } else { format!("{}개", docs.len()) };
+        format!("<p class=\"result\">찾은 문서 {n}. <a href=\"/\">조건 지우기</a></p>")
+    } else {
+        String::new()
+    };
+    let body = if docs.is_empty() {
+        if filtering {
+            "<p class=\"empty\">찾는 문서가 없습니다. 검색어를 바꾸거나 <a href=\"/\">모든 프로젝트</a>로 넓혀 보세요.</p>".to_owned()
+        } else {
+            "<p class=\"empty\">아직 올라온 문서가 없습니다. <a href=\"/upload\">첫 HTML 올리기</a></p>".to_owned()
+        }
+    } else {
+        format!(
+            "<div class=\"table-wrap\"><table class=\"doc-table\"><thead><tr><th>제목</th><th>프로젝트</th><th>올린 사람</th><th>올린 시각</th>\
+             <th class=\"num\">7일 열람</th><th class=\"num\">댓글</th><th><span class=\"visually-hidden\">할 일</span></th></tr></thead>\
+             <tbody>{rows}</tbody></table></div>{pager}"
+        )
+    };
 
-    page(&format!(
-        "<p>{}님, 안녕하세요. <a href=\"/upload\">올리기</a> <a href=\"/tokens\">토큰</a> {admin}\
-         <form method=\"post\" action=\"/logout\" style=\"display:inline\"><button>로그아웃</button></form></p>\
-         <form method=\"get\" action=\"/\">\
-         <input name=\"q\" value=\"{}\" placeholder=\"제목, 올린 사람, 본문\"> \
-         <select name=\"project\"><option value=\"\">모든 프로젝트</option>{options}</select> \
-         <button>검색</button></form>\
-         <table><tr><th>제목</th><th>프로젝트</th><th>올린 사람</th><th>올린 시각</th><th></th></tr>{rows}</table>{empty}{nav}",
-        escape(&user.name),
-        escape(&q),
-        admin = if user.is_admin() { "<a href=\"/admin/hidden\">숨긴 문서</a> <a href=\"/admin/tokens\">토큰 관리</a> " } else { "" },
-    ))
+    let top: String = app
+        .docs
+        .top_viewed(5)
+        .unwrap_or_default()
+        .iter()
+        .map(|(id, title, n)| format!("<li><a href=\"/d/{}\">{}</a><span class=\"meta\">{n}번 열람</span></li>", escape(id), escape(title)))
+        .collect();
+    let top = if top.is_empty() { "<p class=\"quiet\">지난 7일 동안 열린 문서가 없습니다.</p>".to_owned() } else { format!("<ol>{top}</ol>") };
+    let recent: String = app
+        .docs
+        .recent_comments(5)
+        .unwrap_or_default()
+        .iter()
+        .map(|c| {
+            let body: String = c.body.chars().take(60).collect();
+            let more = if c.body.chars().count() > 60 { "…" } else { "" };
+            format!(
+                "<li><a href=\"/d/{}/comments\">{}</a><span class=\"meta\">{}, {}</span>{}{more}</li>",
+                escape(&c.doc_id),
+                escape(&c.doc_title),
+                escape(&c.by_name),
+                when(c.created_at),
+                escape(&body),
+            )
+        })
+        .collect();
+    let recent = if recent.is_empty() { "<p class=\"quiet\">아직 댓글이 없습니다.</p>".to_owned() } else { format!("<ul>{recent}</ul>") };
+
+    shell(
+        &user,
+        "/",
+        &format!(
+            "<div class=\"top\"><div><h1>{}님, 안녕하세요</h1>\
+             <p class=\"lede\">팀이 Claude 로 만든 HTML 결과물을 링크로 열고 찾습니다.</p></div>\
+             <a class=\"btn\" href=\"/upload\">HTML 올리기</a></div>\
+             <dl class=\"figures\"><div><dt>전체 문서</dt><dd>{total}</dd></div>\
+             <div><dt>최근 7일 열람된 문서</dt><dd>{viewed}</dd></div>\
+             <div><dt>내가 올린 문서</dt><dd>{mine}</dd></div></dl>\
+             <div class=\"grid\"><section aria-label=\"문서 목록\">\
+             <form class=\"search\" method=\"get\" action=\"/\" role=\"search\">\
+             <input type=\"search\" name=\"q\" value=\"{}\" placeholder=\"제목, 올린 사람, 본문으로 찾기\" aria-label=\"문서 찾기\">\
+             <input type=\"hidden\" name=\"project\" value=\"{}\"><button class=\"btn\">찾기</button></form>\
+             <nav class=\"chips\" aria-label=\"프로젝트\">{chips}</nav>{result_line}{body}</section>\
+             <aside><section class=\"panel\"><h2>많이 본 문서</h2>{top}</section>\
+             <section class=\"panel\"><h2>최근 댓글</h2>{recent}</section></aside></div>",
+            escape(&user.name),
+            escape(&q),
+            escape(&project),
+        ),
+    )
     .into_response()
 }
 
-fn upload_form(app: &AppState, error: &str) -> Response {
+fn error_box(error: &str) -> String {
+    if error.is_empty() { String::new() } else { format!("<p class=\"error\" role=\"alert\">{}</p>", escape(error)) }
+}
+
+/// `values` 는 오류로 다시 보여 줄 때 입력해 둔 (제목, 프로젝트) 다.
+fn upload_form(app: &AppState, user: &crate::users::User, error: &str, values: (&str, &str)) -> Response {
     let known: String = app
         .docs
         .projects()
@@ -552,31 +738,39 @@ fn upload_form(app: &AppState, error: &str) -> Response {
         .iter()
         .map(|p| format!("<option value=\"{}\">", escape(p)))
         .collect();
-    let error = if error.is_empty() {
-        String::new()
-    } else {
-        format!("<p style=\"color:#c00\">{}</p>", escape(error))
-    };
     let status = if error.is_empty() { StatusCode::OK } else { StatusCode::BAD_REQUEST };
     (
         status,
-        page(&format!(
-            "<h1>문서 올리기</h1>{error}\
-             <p>올린 문서는 등록된 전 직원이 볼 수 있습니다.</p>\
-             <form method=\"post\" action=\"/upload\" enctype=\"multipart/form-data\">\
-             <p><label>제목 <input name=\"title\" required maxlength=\"200\"></label></p>\
-             <p><label>프로젝트 <input name=\"project\" list=\"projects\" maxlength=\"100\"></label>\
-             <datalist id=\"projects\">{known}</datalist></p>\
-             <p><label>HTML 파일 (10MB 이하) <input type=\"file\" name=\"file\" accept=\".html,.htm\" required></label></p>\
-             <button>올리기</button></form><p><a href=\"/\">목록으로</a></p>"
-        )),
+        shell(
+            user,
+            "/upload",
+            &format!(
+                "<div class=\"top\"><div><h1>HTML 올리기</h1>\
+                 <p class=\"lede\">올린 문서는 등록된 전 직원이 볼 수 있습니다. 링크를 받아 공유하세요.</p></div></div>\
+                 <form class=\"form\" method=\"post\" action=\"/upload\" enctype=\"multipart/form-data\">{}\
+                 <div class=\"field\"><label for=\"title\">제목</label>\
+                 <input id=\"title\" name=\"title\" required maxlength=\"200\" value=\"{}\"></div>\
+                 <div class=\"field\"><label for=\"project\">프로젝트</label>\
+                 <input id=\"project\" name=\"project\" list=\"projects\" maxlength=\"100\" value=\"{}\">\
+                 <datalist id=\"projects\">{known}</datalist>\
+                 <span class=\"hint\">비워 두면 미분류로 올라갑니다. 기존 프로젝트는 입력하면 제안됩니다.</span></div>\
+                 <div class=\"field\"><label for=\"file\">HTML 파일</label>\
+                 <input id=\"file\" type=\"file\" name=\"file\" accept=\".html,.htm\" required>\
+                 <span class=\"hint\">.html 또는 .htm, 10MB 이하</span></div>\
+                 <button class=\"btn\">올리기</button></form>\
+                 <p class=\"lede\" style=\"margin-top:24px\">Claude 에서 바로 올리려면 <a href=\"/tokens\">내 토큰</a>을 발급받으세요.</p>",
+                error_box(error),
+                escape(values.0),
+                escape(values.1),
+            ),
+        ),
     )
         .into_response()
 }
 
 pub async fn upload_page(State(app): State<AppState>, jar: PrivateCookieJar) -> Response {
     match current_user(&app, &jar) {
-        Ok(_) => upload_form(&app, ""),
+        Ok(user) => upload_form(&app, &user, "", ("", "")),
         Err(r) => r,
     }
 }
@@ -627,17 +821,17 @@ pub async fn upload(State(app): State<AppState>, jar: PrivateCookieJar, form: Mu
     };
     let form = match read_form(form).await {
         Ok(f) => f,
-        Err(msg) => return upload_form(&app, msg),
+        Err(msg) => return upload_form(&app, &user, msg, ("", "")),
     };
     if form.title.is_empty() {
-        return upload_form(&app, "제목을 입력해 주세요.");
+        return upload_form(&app, &user, "제목을 입력해 주세요.", (&form.title, &form.project));
     }
     if form.title.chars().count() > 200 || form.project.chars().count() > 100 {
-        return upload_form(&app, "제목은 200자, 프로젝트는 100자 이하로 입력해 주세요.");
+        return upload_form(&app, &user, "제목은 200자, 프로젝트는 100자 이하로 입력해 주세요.", (&form.title, &form.project));
     }
     let bytes = match check_file(form.file) {
         Ok(b) => b,
-        Err(msg) => return upload_form(&app, msg),
+        Err(msg) => return upload_form(&app, &user, msg, (&form.title, &form.project)),
     };
     match app.docs.insert(&form.title, &form.project, &user, &bytes) {
         Ok(id) => Redirect::to(&format!("/uploaded/{id}")).into_response(),
@@ -667,27 +861,51 @@ fn forbidden() -> Response {
     (StatusCode::FORBIDDEN, page("올린 사람이나 관리자만 할 수 있습니다.")).into_response()
 }
 
-fn replace_form(doc: &Doc, error: &str) -> Response {
+/// 문서 하나에 딸린 화면(이력, 댓글, 새 버전)의 머리말. 지금 화면은 링크 대신 글자로 둔다.
+fn doc_header(doc: &Doc, here: &str) -> String {
+    let id = escape(&doc.id);
+    let tab = |href: String, label: &str| {
+        if label == here { format!("<span aria-current=\"page\">{label}</span>") } else { format!("<a href=\"{href}\">{label}</a>") }
+    };
+    format!(
+        "<div class=\"top\"><div><h1>{}</h1><p class=\"lede\">{} 올림, {}</p></div>\
+         <a class=\"btn\" href=\"/d/{id}\">문서 열기</a></div>\
+         <nav class=\"chips\" aria-label=\"문서 메뉴\">{}{}</nav>",
+        escape(&doc.title),
+        escape(&doc.uploader_name),
+        when(doc.created_at),
+        tab(format!("/d/{id}/history"), "이력"),
+        tab(format!("/d/{id}/comments"), "댓글"),
+    )
+}
+
+fn replace_form(user: &crate::users::User, doc: &Doc, error: &str) -> Response {
     let status = if error.is_empty() { StatusCode::OK } else { StatusCode::BAD_REQUEST };
-    let error = if error.is_empty() { String::new() } else { format!("<p style=\"color:#c00\">{}</p>", escape(error)) };
     (
         status,
-        page(&format!(
-            "<h1>새 버전 올리기: {}</h1>{error}\
-             <p>링크는 그대로이고 내용만 새 파일로 바뀝니다. 이전 버전은 이력에 남습니다.</p>\
-             <form method=\"post\" action=\"/d/{id}/replace\" enctype=\"multipart/form-data\">\
-             <p><label>HTML 파일 (10MB 이하) <input type=\"file\" name=\"file\" accept=\".html,.htm\" required></label></p>\
-             <button>올리기</button></form><p><a href=\"/d/{id}/history\">이력으로</a></p>",
-            escape(&doc.title),
-            id = escape(&doc.id),
-        )),
+        shell(
+            user,
+            "/",
+            &format!(
+                "{}<h2>새 버전 올리기</h2>\
+                 <p class=\"lede\" style=\"margin-bottom:16px\">링크는 그대로이고 내용만 새 파일로 바뀝니다. 이전 버전은 이력에 남습니다.</p>\
+                 <form class=\"form\" method=\"post\" action=\"/d/{id}/replace\" enctype=\"multipart/form-data\">{}\
+                 <div class=\"field\"><label for=\"file\">HTML 파일</label>\
+                 <input id=\"file\" type=\"file\" name=\"file\" accept=\".html,.htm\" required>\
+                 <span class=\"hint\">.html 또는 .htm, 10MB 이하</span></div>\
+                 <button class=\"btn\">새 버전 올리기</button></form>",
+                doc_header(doc, ""),
+                error_box(error),
+                id = escape(&doc.id),
+            ),
+        ),
     )
         .into_response()
 }
 
 pub async fn replace_page(State(app): State<AppState>, jar: PrivateCookieJar, Path(id): Path<String>) -> Response {
     match user_and_doc(&app, &jar, &id) {
-        Ok((user, doc)) if can_modify(&user, &doc) => replace_form(&doc, ""),
+        Ok((user, doc)) if can_modify(&user, &doc) => replace_form(&user, &doc, ""),
         Ok(_) => forbidden(),
         Err(r) => r,
     }
@@ -708,11 +926,11 @@ pub async fn replace(
     }
     let form = match read_form(form).await {
         Ok(f) => f,
-        Err(msg) => return replace_form(&doc, msg),
+        Err(msg) => return replace_form(&user, &doc, msg),
     };
     let bytes = match check_file(form.file) {
         Ok(b) => b,
-        Err(msg) => return replace_form(&doc, msg),
+        Err(msg) => return replace_form(&user, &doc, msg),
     };
     match app.docs.replace(&id, &user, &bytes) {
         Ok(_) => Redirect::to(&format!("/d/{id}/history")).into_response(),
@@ -734,38 +952,46 @@ pub async fn history(State(app): State<AppState>, jar: PrivateCookieJar, Path(id
     let rows: String = versions
         .iter()
         .map(|v| {
-            let current = if Some(v.n) == latest { " (현재)" } else { "" };
+            let current = if Some(v.n) == latest { " <span class=\"tag\">현재</span>" } else { "" };
             let restore = if modify && Some(v.n) != latest {
                 format!(
-                    "<form method=\"post\" action=\"/d/{}/restore/{}\" style=\"display:inline\">\
-                     <button>이 버전으로 되돌리기</button></form>",
+                    "<form method=\"post\" action=\"/d/{}/restore/{}\" \
+                     onsubmit=\"return confirm('{}번 버전 내용을 새 버전으로 다시 올릴까요?')\">\
+                     <button class=\"link\">이 버전으로 되돌리기</button></form>",
                     escape(&doc.id),
-                    v.n
+                    v.n,
+                    v.n,
                 )
             } else {
                 String::new()
             };
             format!(
-                "<tr><td>{}{current}</td><td>{}</td><td>{}</td><td><a href=\"/d/{}/v/{}\">열기</a></td><td>{restore}</td></tr>",
+                "<tr><td>{}번{current}</td><td>{}</td><td class=\"when\">{}</td>\
+                 <td class=\"actions\"><a href=\"/d/{}/v/{}\">열기</a>{restore}</td></tr>",
                 v.n,
                 escape(&v.by_name),
-                show_time(v.created_at),
+                when(v.created_at),
                 escape(&doc.id),
                 v.n,
             )
         })
         .collect();
     let replace_link = if modify {
-        format!(" <a href=\"/d/{}/replace\">새 버전 올리기</a>", escape(&doc.id))
+        format!("<p><a class=\"btn\" href=\"/d/{}/replace\">새 버전 올리기</a></p>", escape(&doc.id))
     } else {
         String::new()
     };
-    page(&format!(
-        "<h1>{}</h1><p><a href=\"/d/{id}\">현재 버전 열기</a>{replace_link} <a href=\"/\">목록으로</a></p>\
-         <table><tr><th>버전</th><th>올린 사람</th><th>올린 시각</th><th></th><th></th></tr>{rows}</table>",
-        escape(&doc.title),
-        id = escape(&doc.id),
-    ))
+    shell(
+        &user,
+        "/",
+        &format!(
+            "{}<h2>버전 이력</h2>\
+             <p class=\"lede\" style=\"margin-bottom:12px\">되돌리면 옛 내용이 새 버전으로 올라가고, 중간 버전도 그대로 남습니다.</p>\
+             <div class=\"table-wrap narrow\"><table><thead><tr><th>버전</th><th>올린 사람</th><th>올린 시각</th>\
+             <th><span class=\"visually-hidden\">할 일</span></th></tr></thead><tbody>{rows}</tbody></table></div>{replace_link}",
+            doc_header(&doc, "이력"),
+        ),
+    )
     .into_response()
 }
 
@@ -773,37 +999,49 @@ const MAX_COMMENT: usize = 2000;
 
 fn comments_page(doc: &Doc, user: &crate::users::User, comments: &[Comment], error: &str) -> Response {
     let status = if error.is_empty() { StatusCode::OK } else { StatusCode::BAD_REQUEST };
-    let error = if error.is_empty() { String::new() } else { format!("<p style=\"color:#c00\">{}</p>", escape(error)) };
     let id = escape(&doc.id);
     let items: String = comments
         .iter()
         .map(|c| {
             let delete = if c.by_email == user.email || user.is_admin() {
                 format!(
-                    "<form method=\"post\" action=\"/d/{id}/comments/{}/delete\" style=\"display:inline\"><button>삭제</button></form>",
+                    " <form method=\"post\" action=\"/d/{id}/comments/{}/delete\" style=\"display:inline\" \
+                     onsubmit=\"return confirm('이 댓글을 지울까요?')\"><button class=\"link danger\">삭제</button></form>",
                     c.id
                 )
             } else {
                 String::new()
             };
             format!(
-                "<li><b>{}</b> {} {delete}<div style=\"white-space:pre-wrap\">{}</div></li>",
+                "<li><b>{}</b> <span class=\"meta\">{}</span>{delete}<div class=\"body\">{}</div></li>",
                 escape(&c.by_name),
-                show_time(c.created_at),
+                when(c.created_at),
                 escape(&c.body)
             )
         })
         .collect();
-    let empty = if comments.is_empty() { "<p>댓글이 없습니다.</p>" } else { "" };
+    let list = if comments.is_empty() {
+        "<p class=\"empty\">아직 댓글이 없습니다. 문서를 보고 의견을 남겨 주세요.</p>".to_owned()
+    } else {
+        format!("<ul class=\"comments\">{items}</ul>")
+    };
     (
         status,
-        page(&format!(
-            "<h1>{}</h1><p><a href=\"/d/{id}\">문서 열기</a> <a href=\"/d/{id}/history\">이력</a> <a href=\"/\">목록으로</a></p>\
-             <h2>댓글</h2>{empty}<ul>{items}</ul>{error}\
-             <form method=\"post\" action=\"/d/{id}/comments\"><p><textarea name=\"body\" rows=\"4\" cols=\"60\" maxlength=\"{MAX_COMMENT}\" required></textarea></p>\
-             <button>댓글 남기기</button></form>",
-            escape(&doc.title)
-        )),
+        shell(
+            user,
+            "/",
+            &format!(
+                "{}<h2>댓글 {}개</h2>{list}\
+                 <form class=\"form\" method=\"post\" action=\"/d/{id}/comments\">{}\
+                 <div class=\"field\"><label for=\"body\">댓글 남기기</label>\
+                 <textarea id=\"body\" name=\"body\" rows=\"4\" maxlength=\"{MAX_COMMENT}\" required></textarea>\
+                 <span class=\"hint\">{MAX_COMMENT}자까지. 쓴 사람과 관리자만 지울 수 있습니다.</span></div>\
+                 <button class=\"btn\">댓글 남기기</button></form>",
+                doc_header(doc, "댓글"),
+                comments.len(),
+                error_box(error),
+            ),
+        ),
     )
         .into_response()
 }
@@ -907,19 +1145,25 @@ pub async fn restore(
 
 /// 올린 직후 링크를 보여 준다.
 pub async fn uploaded(State(app): State<AppState>, jar: PrivateCookieJar, Path(id): Path<String>) -> Response {
-    if let Err(r) = current_user(&app, &jar) {
-        return r;
-    }
+    let user = match current_user(&app, &jar) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
     match app.docs.get(&id) {
-        Ok(Some(d)) => page(&format!(
-            "<p>올렸습니다: <a href=\"/d/{id}\">{}</a></p>\
-             <p><input id=\"link\" readonly size=\"60\" value=\"{base}/d/{id}\" onfocus=\"this.select()\"> \
-             <button type=\"button\" onclick=\"navigator.clipboard.writeText(link.value);this.textContent='복사됨'\">링크 복사</button></p>\
-             <p><a href=\"/\">목록으로</a></p>",
-            escape(&d.title),
-            id = escape(&d.id),
-            base = escape(app.base_url.trim_end_matches('/')),
-        ))
+        Ok(Some(d)) => shell(
+            &user,
+            "/upload",
+            &format!(
+                "<div class=\"top\"><div><h1>올렸습니다</h1><p class=\"lede\">{}</p></div></div>\
+                 <p>이 링크를 보내면 등록된 직원 누구나 로그인 후 볼 수 있습니다.</p>\
+                 <div class=\"copy\"><input id=\"link\" readonly value=\"{base}/d/{id}\" onfocus=\"this.select()\" aria-label=\"공유 링크\">\
+                 <button class=\"btn\" type=\"button\" onclick=\"navigator.clipboard.writeText(link.value);this.textContent='복사됨'\">링크 복사</button></div>\
+                 <p class=\"actions\"><a href=\"/d/{id}\">문서 열기</a><a href=\"/upload\">하나 더 올리기</a><a href=\"/\">문서 목록</a></p>",
+                escape(&d.title),
+                id = escape(&d.id),
+                base = escape(app.base_url.trim_end_matches('/')),
+            ),
+        )
         .into_response(),
         Ok(None) => not_found(),
         Err(e) => server_error("문서 조회", e),
@@ -971,11 +1215,11 @@ fn admin_only() -> Response {
 
 /// 숨긴 문서 목록 (정책서 D4-1: 살리는 일은 관리자만).
 pub async fn hidden_list(State(app): State<AppState>, jar: PrivateCookieJar) -> Response {
-    match current_user(&app, &jar) {
-        Ok(u) if u.is_admin() => {}
+    let user = match current_user(&app, &jar) {
+        Ok(u) if u.is_admin() => u,
         Ok(_) => return admin_only(),
         Err(r) => return r,
-    }
+    };
     let docs = match app.docs.hidden() {
         Ok(d) => d,
         Err(e) => return server_error("숨긴 문서 조회", e),
@@ -984,22 +1228,32 @@ pub async fn hidden_list(State(app): State<AppState>, jar: PrivateCookieJar) -> 
         .iter()
         .map(|d| {
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>\
-                 <form method=\"post\" action=\"/d/{id}/unhide\" style=\"display:inline\"><button>살리기</button></form></td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td class=\"when\">{}</td><td class=\"actions\">\
+                 <form method=\"post\" action=\"/d/{id}/unhide\"><button class=\"link\">살리기</button></form></td></tr>",
                 escape(&d.title),
-                if d.project.is_empty() { "미분류".into() } else { escape(&d.project) },
+                if d.project.is_empty() { "<span class=\"tag none\">미분류</span>".into() } else { format!("<span class=\"tag\">{}</span>", escape(&d.project)) },
                 escape(&d.uploader_name),
-                show_time(d.created_at),
+                when(d.created_at),
                 id = escape(&d.id),
             )
         })
         .collect();
-    let empty = if docs.is_empty() { "<p>숨긴 문서가 없습니다.</p>" } else { "" };
-    page(&format!(
-        "<h1>숨긴 문서</h1><p>살리면 목록과 검색에 다시 나오고 링크도 열립니다.</p>\
-         <table><tr><th>제목</th><th>프로젝트</th><th>올린 사람</th><th>올린 시각</th><th></th></tr>{rows}</table>{empty}\
-         <p><a href=\"/\">목록으로</a></p>"
-    ))
+    let body = if docs.is_empty() {
+        "<p class=\"empty\">숨긴 문서가 없습니다.</p>".to_owned()
+    } else {
+        format!(
+            "<div class=\"table-wrap narrow\"><table><thead><tr><th>제목</th><th>프로젝트</th><th>올린 사람</th><th>올린 시각</th>\
+             <th><span class=\"visually-hidden\">할 일</span></th></tr></thead><tbody>{rows}</tbody></table></div>"
+        )
+    };
+    shell(
+        &user,
+        "/admin/hidden",
+        &format!(
+            "<div class=\"top\"><div><h1>숨긴 문서</h1>\
+             <p class=\"lede\">목록에서 지운 문서입니다. 살리면 목록과 검색에 다시 나오고 링크도 열립니다.</p></div></div>{body}"
+        ),
+    )
     .into_response()
 }
 
@@ -1205,16 +1459,61 @@ mod tests {
     }
 
     #[test]
+    fn 시각은_가까우면_상대로_멀면_날짜로_보인다() {
+        let now = 1_795_000_000; // 2026-11-18 20:06 (한국 시각)
+        assert_eq!(relative(now - 10, now), "방금");
+        assert_eq!(relative(now - 5 * 60, now), "5분 전");
+        assert_eq!(relative(now - 3 * 3600, now), "3시간 전");
+        assert_eq!(relative(now - 2 * 86400, now), "2일 전");
+        assert_eq!(relative(now - 30 * 86400, now), "10월 19일");
+        assert_eq!(relative(now - 400 * 86400, now), "2025년 10월 14일");
+        assert_eq!(relative(now + 30, now), "방금", "서버 시계가 조금 어긋나도 미래로 보이지 않는다");
+        let html = when(now);
+        assert!(html.starts_with("<time datetime=\"") && html.contains(&format!("title=\"{}\"", show_time(now))));
+    }
+
+    #[test]
+    fn 대시보드_숫자와_활동을_숨긴_것_빼고_센다() {
+        let (d, dir) = docs();
+        let (a, b) = (user("a@x.im", "가나"), user("b@x.im", "다라"));
+        let x = d.insert("많이 본", "", &a, b"x").unwrap();
+        let y = d.insert("조금 본", "", &b, b"y").unwrap();
+        let z = d.insert("숨길 것", "", &a, b"z").unwrap();
+        for _ in 0..3 {
+            d.record_view(&x).unwrap();
+        }
+        d.record_view(&y).unwrap();
+        d.record_view(&z).unwrap();
+        // 8일 전 열람은 지난 7일에 들지 않는다.
+        d.db.lock().unwrap().execute("INSERT INTO views (doc_id, at) VALUES (?1, ?2)", params![y, now_unix() - 8 * 86400]).unwrap();
+        d.add_comment(&y, &a, "첫 댓글").unwrap();
+        d.add_comment(&z, &a, "숨긴 문서 댓글").unwrap();
+        d.add_comment(&x, &b, "최근 댓글").unwrap();
+        d.hide(&z).unwrap();
+
+        assert_eq!(d.summary("a@x.im").unwrap(), (2, 2, 1));
+        let top = d.top_viewed(5).unwrap();
+        assert_eq!(top.iter().map(|t| (t.1.as_str(), t.2)).collect::<Vec<_>>(), [("많이 본", 3), ("조금 본", 1)]);
+        let recent = d.recent_comments(5).unwrap();
+        assert_eq!(recent.iter().map(|c| c.body.as_str()).collect::<Vec<_>>(), ["최근 댓글", "첫 댓글"]);
+        assert_eq!(recent[0].doc_title, "많이 본");
+        let act = d.activity(&[x.clone(), y.clone()]).unwrap();
+        assert_eq!((act[&x], act[&y]), ((3, 1), (1, 1)));
+        assert!(d.activity(&[]).unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn 본문에서_찾은_검색어_주변을_발췌한다() {
         let (d, dir) = docs();
         let a = user("a@x.im", "가나");
         let long = format!("<p>{}분기 매출 요약{}</p>", "앞".repeat(100), "뒤".repeat(100));
         let id = d.insert("보고", "", &a, long.as_bytes()).unwrap();
         let e = d.excerpt(&id, "매출").unwrap().unwrap();
-        assert!(e.contains("분기 매출 요약"));
-        assert!(e.chars().count() <= 120, "발췌는 짧게");
+        assert!(e.contains("분기 매출 요약") && e.starts_with('…') && e.ends_with('…'), "앞뒤가 잘렸으면 … 를 붙인다");
+        assert!(e.chars().count() <= 122, "발췌는 짧게");
         let start = d.insert("짧은", "", &a, "<p>Revenue 맨 앞</p>".as_bytes()).unwrap();
-        assert!(d.excerpt(&start, "revenue").unwrap().unwrap().starts_with("Revenue"), "대소문자 무시, 맨 앞 일치");
+        assert_eq!(d.excerpt(&start, "revenue").unwrap().unwrap(), "Revenue 맨 앞", "대소문자 무시, 잘리지 않으면 … 없음");
         assert_eq!(d.excerpt(&id, "없는말").unwrap(), None);
         std::fs::remove_dir_all(dir).unwrap();
     }

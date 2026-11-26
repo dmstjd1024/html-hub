@@ -1,6 +1,6 @@
 use crate::{
     AppState,
-    auth::{current_user, escape, page},
+    auth::{current_user, escape, page, shell},
     docs::{check_file, read_form},
 };
 use anyhow::Result;
@@ -124,7 +124,7 @@ impl Tokens {
 }
 
 fn show_time(unix: i64) -> String {
-    crate::docs::show_time(unix)
+    crate::docs::when(unix)
 }
 
 pub async fn tokens_page(State(app): State<AppState>, jar: PrivateCookieJar) -> Response {
@@ -141,21 +141,29 @@ pub async fn tokens_page(State(app): State<AppState>, jar: PrivateCookieJar) -> 
     };
     let state = match info {
         Some(i) => format!(
-            "<p>발급된 토큰이 있습니다 (발급 {}, 마지막 사용 {}).</p>\
-             <form method=\"post\" action=\"/tokens/revoke\"><button>폐기</button></form>",
+            "<section class=\"panel\"><h2>발급된 토큰이 있습니다</h2>\
+             <p class=\"quiet\">발급 {}, 마지막 사용 {}</p>\
+             <form method=\"post\" action=\"/tokens/revoke\" style=\"margin-top:8px\" \
+             onsubmit=\"return confirm('토큰을 폐기할까요? 이 토큰을 쓰는 도구는 더 올리지 못합니다.')\">\
+             <button class=\"link danger\">폐기</button></form></section>",
             show_time(i.created_at),
             i.last_used_at.map_or("없음".into(), show_time)
         ),
-        None => "<p>발급된 토큰이 없습니다.</p>".into(),
+        None => "<section class=\"panel\"><h2>발급된 토큰이 없습니다</h2>\
+                 <p class=\"quiet\">발급하면 Claude 나 터미널에서 이 사이트로 바로 올릴 수 있습니다.</p></section>".into(),
     };
-    page(&format!(
-        "<h1>개인 토큰</h1>\
-         <p>Claude 같은 도구가 터미널에서 문서를 올릴 때 쓰는 열쇠입니다. 이 토큰으로 올린 문서는 {} 님이 올린 것으로 기록됩니다. 남에게 알려 주지 마세요.</p>\
-         {state}\
-         <form method=\"post\" action=\"/tokens\"><button>새 토큰 발급 (이전 토큰은 폐기됩니다)</button></form>\
-         <p><a href=\"/\">목록으로</a></p>",
-        escape(&user.name)
-    ))
+    shell(
+        &user,
+        "/tokens",
+        &format!(
+            "<div class=\"top\"><div><h1>내 토큰</h1>\
+             <p class=\"lede\">도구가 문서를 올릴 때 쓰는 열쇠입니다. 이 토큰으로 올린 문서는 {} 님이 올린 것으로 기록되니 남에게 알려 주지 마세요.</p></div></div>\
+             <div class=\"form\">{state}\
+             <form method=\"post\" action=\"/tokens\"><button class=\"btn\">새 토큰 발급</button></form>\
+             <p class=\"lede\" style=\"margin-top:8px;font-size:13px\">새로 발급하면 이전 토큰은 바로 폐기됩니다.</p></div>",
+            escape(&user.name)
+        ),
+    )
     .into_response()
 }
 
@@ -165,14 +173,19 @@ pub async fn tokens_issue(State(app): State<AppState>, jar: PrivateCookieJar) ->
         Err(r) => return r,
     };
     match app.tokens.issue(&user.email) {
-        Ok(token) => page(&format!(
-            "<h1>새 토큰</h1><p>지금 한 번만 보입니다. 복사해 두세요.</p>\
-             <pre style=\"user-select:all\">{token}</pre>\
-             <p>사용 예:</p>\
-             <pre>curl -H \"Authorization: Bearer {token}\" \\\n  -F title=\"제목\" -F project=\"프로젝트\" -F file=@문서.html \\\n  {}/api/upload</pre>\
-             <p><a href=\"/tokens\">돌아가기</a></p>",
-            escape(app.base_url.trim_end_matches('/'))
-        ))
+        Ok(token) => shell(
+            &user,
+            "/tokens",
+            &format!(
+                "<div class=\"top\"><div><h1>새 토큰</h1>\
+                 <p class=\"lede\">이 화면을 벗어나면 다시 볼 수 없습니다. 지금 복사해 두세요.</p></div></div>\
+                 <pre style=\"user-select:all\">{token}</pre>\
+                 <h2 style=\"margin-top:24px\">터미널에서 올리기</h2>\
+                 <pre>curl -H \"Authorization: Bearer {token}\" \\\n  -F title=\"제목\" -F project=\"프로젝트\" -F file=@문서.html \\\n  {}/api/upload</pre>\
+                 <p><a href=\"/tokens\">내 토큰으로 돌아가기</a></p>",
+                escape(app.base_url.trim_end_matches('/'))
+            ),
+        )
         .into_response(),
         Err(e) => {
             eprintln!("토큰 발급 실패: {e}");
@@ -201,11 +214,11 @@ fn admin_only() -> Response {
 
 /// 직원들의 활성 토큰 목록과 강제 폐기 (정책서 T5: 토큰이 새면 관리자가 막는다).
 pub async fn admin_tokens(State(app): State<AppState>, jar: PrivateCookieJar) -> Response {
-    match current_user(&app, &jar) {
-        Ok(u) if u.is_admin() => {}
+    let user = match current_user(&app, &jar) {
+        Ok(u) if u.is_admin() => u,
         Ok(_) => return admin_only(),
         Err(r) => return r,
-    }
+    };
     let list = match app.tokens.active() {
         Ok(l) => l,
         Err(e) => {
@@ -217,21 +230,31 @@ pub async fn admin_tokens(State(app): State<AppState>, jar: PrivateCookieJar) ->
         .iter()
         .map(|(email, i)| {
             format!(
-                "<tr><td>{email}</td><td>{}</td><td>{}</td><td>\
-                 <form method=\"post\" action=\"/admin/tokens/revoke\" style=\"display:inline\">\
-                 <input type=\"hidden\" name=\"email\" value=\"{email}\"><button>폐기</button></form></td></tr>",
+                "<tr><td>{email}</td><td class=\"when\">{}</td><td class=\"when\">{}</td><td class=\"actions\">\
+                 <form method=\"post\" action=\"/admin/tokens/revoke\" onsubmit=\"return confirm('{email} 의 토큰을 폐기할까요?')\">\
+                 <input type=\"hidden\" name=\"email\" value=\"{email}\"><button class=\"link danger\">폐기</button></form></td></tr>",
                 show_time(i.created_at),
                 i.last_used_at.map_or("없음".into(), show_time),
                 email = escape(email),
             )
         })
         .collect();
-    let empty = if list.is_empty() { "<p>발급된 토큰이 없습니다.</p>" } else { "" };
-    page(&format!(
-        "<h1>토큰 관리</h1><p>폐기하면 그 토큰으로는 더 올릴 수 없습니다. 직원은 /tokens 에서 새로 발급받을 수 있습니다.</p>\
-         <table><tr><th>직원</th><th>발급</th><th>마지막 사용</th><th></th></tr>{rows}</table>{empty}\
-         <p><a href=\"/\">목록으로</a></p>"
-    ))
+    let body = if list.is_empty() {
+        "<p class=\"empty\">발급된 토큰이 없습니다.</p>".to_owned()
+    } else {
+        format!(
+            "<div class=\"table-wrap narrow\"><table><thead><tr><th>직원</th><th>발급</th><th>마지막 사용</th>\
+             <th><span class=\"visually-hidden\">할 일</span></th></tr></thead><tbody>{rows}</tbody></table></div>"
+        )
+    };
+    shell(
+        &user,
+        "/admin/tokens",
+        &format!(
+            "<div class=\"top\"><div><h1>토큰 관리</h1>\
+             <p class=\"lede\">토큰이 새었다면 여기서 폐기하세요. 폐기한 토큰으로는 더 올릴 수 없고, 직원은 내 토큰에서 새로 발급받을 수 있습니다.</p></div></div>{body}"
+        ),
+    )
     .into_response()
 }
 

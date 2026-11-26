@@ -205,9 +205,9 @@ fn now_nanos() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
 }
 
-/// 목록 표의 제목 칸들 (`<td><a href="/d/..">제목</a>`), 위에서부터.
+/// 목록 표의 제목 칸들 (`<a class="doc-title" href="/d/..">제목</a>`), 위에서부터. 옆 패널의 링크는 세지 않는다.
 fn listed_titles(body: &str) -> Vec<String> {
-    body.split("<tr><td><a href=\"/d/")
+    body.split("<a class=\"doc-title\" href=\"/d/")
         .skip(1)
         .map(|s| s.split_once("\">").unwrap().1.split_once("</a>").unwrap().0.to_owned())
         .collect()
@@ -291,9 +291,23 @@ async fn r1_1_올리기_화면과_입력_검사() {
         assert_eq!(r.status, StatusCode::BAD_REQUEST, "{msg}");
         assert!(r.body.contains(msg), "안내 문구 '{msg}' 가 없다");
     }
-    // 본문 한도를 크게 넘는 요청도 400 과 안내로 끝난다.
-    let r = s.multipart("/upload", Some(&me), None, &[("title", "큼")], Some(("big.html", &vec![b'a'; 11 * 1024 * 1024]))).await;
-    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    // 본문 한도를 크게 넘는 요청은 거부된다. 서버가 본문을 다 받기 전에 400 을 보내고 연결을 닫으면
+    // 클라이언트에는 연결 오류로 보일 수 있다 (병렬 실행 중 한 번 관찰). 둘 다 거부로 본다.
+    let boundary = "e2eBig";
+    let mut big = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"big.html\"\r\n\r\n").into_bytes();
+    big.extend(vec![b'a'; 11 * 1024 * 1024]);
+    big.extend(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let res = s
+        .http
+        .post(format!("{}/upload", s.base))
+        .header(header::COOKIE, &me)
+        .header(header::CONTENT_TYPE, format!("multipart/form-data; boundary={boundary}"))
+        .body(big)
+        .send()
+        .await;
+    if let Ok(r) = res {
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    }
     assert_eq!(s.doc_count().await, 0, "거부된 요청은 저장되지 않는다");
 
     // .htm 과 대문자 확장자도 받는다.
@@ -374,8 +388,8 @@ async fn r1_3_목록은_최신순이고_제목_올린사람_본문으로_찾는�
 
     let r = s.get("/", Some(&owner)).await;
     assert_eq!(listed_titles(&r.body), ["설계 메모", "월간 보고"], "최신순");
-    for col in ["A", "B", "김올림", "이다른"] {
-        assert!(r.body.contains(&format!("<td>{col}</td>")), "목록에 {col}");
+    for col in ["<span class=\"tag\">A</span>", "<span class=\"tag\">B</span>", "<td>김올림</td>", "<td>이다른</td>"] {
+        assert!(r.body.contains(col), "목록에 {col}");
     }
 
     let find = |q: &str| format!("/?q={}", enc(q));
@@ -386,9 +400,10 @@ async fn r1_3_목록은_최신순이고_제목_올린사람_본문으로_찾는�
     // 본문 검색: 보이는 글자만, 걸리면 주변 글자를 발췌로 보여 준다.
     let r = s.get(&find("매출"), Some(&owner)).await;
     assert_eq!(listed_titles(&r.body), ["월간 보고"]);
-    assert!(r.body.contains("…분기 매출 요약…"), "발췌");
+    assert!(r.body.contains("<span class=\"excerpt\">분기 매출 요약</span>"), "발췌 (잘리지 않았으면 … 없음)");
+    assert!(r.body.contains("찾은 문서 1개") && r.body.contains("조건 지우기"), "검색 결과 줄");
     assert!(listed_titles(&s.get(&find("숨은글자"), Some(&owner)).await.body).is_empty(), "script 안은 찾지 않는다");
-    assert!(!s.get(&find("보고"), Some(&owner)).await.body.contains("<small"), "제목으로만 걸리면 발췌 없음");
+    assert!(!s.get(&find("보고"), Some(&owner)).await.body.contains("class=\"excerpt\""), "제목으로만 걸리면 발췌 없음");
 
     let none = s.get(&find("없는검색어"), Some(&owner)).await;
     assert!(none.body.contains("문서가 없습니다"));
@@ -404,8 +419,8 @@ async fn r1_4_프로젝트를_고르면_그_프로젝트만_보인다() {
 
     let r = s.get("/?project=A", Some(&me)).await;
     assert_eq!(listed_titles(&r.body), ["가"]);
-    assert!(r.body.contains("<option selected>A</option>") && r.body.contains("<option>B</option>"));
-    assert!(s.get("/", Some(&me)).await.body.contains("<td>미분류</td>"));
+    assert!(r.body.contains("aria-current=\"true\">A</a>") && r.body.contains("project=B\">B</a>"), "프로젝트 칩");
+    assert!(s.get("/", Some(&me)).await.body.contains("<span class=\"tag none\">미분류</span>"));
 
     // 올리기 화면은 기존 프로젝트를 제안한다.
     let up = s.get("/upload", Some(&me)).await.body;
@@ -637,3 +652,64 @@ async fn r3_댓글_쓰기와_지우기_규칙() {
     s.post(&format!("/d/{id}/delete"), Some(&owner), &[]).await;
     assert_eq!(s.get(&path, Some(&owner)).await.status, StatusCode::NOT_FOUND);
 }
+
+// ---------- 대시보드 ----------
+
+#[tokio::test]
+async fn 대시보드는_요약_숫자와_많이_본_문서와_최근_댓글을_보여준다() {
+    let s = Server::start().await;
+    let (owner, other) = (s.login(OWNER), s.login(OTHER));
+
+    let empty = s.get("/", Some(&owner)).await.body;
+    assert!(empty.contains("아직 올라온 문서가 없습니다") && empty.contains("href=\"/upload\""), "빈 화면은 올리기로 안내");
+    assert!(empty.contains("지난 7일 동안 열린 문서가 없습니다") && empty.contains("아직 댓글이 없습니다"));
+
+    let hot = s.upload(&owner, "자주 보는 보고서", "A", "<p>1</p>").await;
+    let cold = s.upload(&other, "가끔 보는 메모", "B", "<p>2</p>").await;
+    for _ in 0..3 {
+        s.get(&format!("/d/{hot}"), Some(&other)).await;
+    }
+    s.get(&format!("/d/{cold}"), Some(&owner)).await;
+    s.post(&format!("/d/{cold}/comments"), Some(&owner), &[("body", "확인했습니다")]).await;
+
+    let r = s.get("/", Some(&owner)).await.body;
+    let figure = |label: &str| {
+        let after = r.split_once(&format!("<dt>{label}</dt><dd>")).unwrap().1;
+        after.split_once("</dd>").unwrap().0.to_owned()
+    };
+    assert_eq!((figure("전체 문서"), figure("최근 7일 열람된 문서"), figure("내가 올린 문서")), ("2".into(), "2".into(), "1".into()));
+
+    let panel = r.split_once("<h2>많이 본 문서</h2>").unwrap().1;
+    let (first, second) = (panel.find("자주 보는 보고서").unwrap(), panel.find("가끔 보는 메모").unwrap());
+    assert!(first < second && panel.contains("3번 열람"), "열람 많은 순");
+    let comments = r.split_once("<h2>최근 댓글</h2>").unwrap().1;
+    assert!(comments.contains(&format!("href=\"/d/{cold}/comments\">가끔 보는 메모</a>")) && comments.contains("확인했습니다"));
+
+    // 문서 줄마다 7일 열람 수와 댓글 수.
+    let row = r.split(&format!("href=\"/d/{hot}\">자주 보는 보고서</a>")).nth(1).unwrap().split("</tr>").next().unwrap();
+    assert!(row.contains("data-label=\"7일 열람\">3</td><td class=\"num\" data-label=\"댓글\">0</td>"), "{row}");
+    let row = r.split(&format!("href=\"/d/{cold}\">가끔 보는 메모</a>")).nth(1).unwrap().split("</tr>").next().unwrap();
+    assert!(row.contains("data-label=\"7일 열람\">1</td><td class=\"num\" data-label=\"댓글\">1</td>"), "{row}");
+
+    // 숨긴 문서는 숫자와 패널에서 빠진다.
+    s.post(&format!("/d/{hot}/delete"), Some(&owner), &[]).await;
+    let r = s.get("/", Some(&owner)).await.body;
+    assert!(r.contains("<dt>전체 문서</dt><dd>1</dd>") && !r.contains("자주 보는 보고서"));
+
+    // 메뉴 띠는 지금 화면을 표시하고, 관리 메뉴는 관리자에게만 보인다.
+    assert!(r.contains("<a href=\"/\" aria-current=\"page\">문서</a>"));
+    assert!(s.get("/upload", Some(&owner)).await.body.contains("<a href=\"/upload\" aria-current=\"page\">올리기</a>"));
+    assert!(!r.contains("토큰 관리") && s.get("/", Some(&s.login(ADMIN))).await.body.contains("토큰 관리"));
+}
+
+#[tokio::test]
+async fn 올리기_오류가_나도_입력한_제목과_프로젝트는_남는다() {
+    let s = Server::start().await;
+    let r = s
+        .multipart("/upload", Some(&s.login(OWNER)), None, &[("title", "분기 보고"), ("project", "재무")], Some(("a.txt", b"x")))
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(r.body.contains("role=\"alert\"") && r.body.contains(".html 파일만"));
+    assert!(r.body.contains("value=\"분기 보고\"") && r.body.contains("value=\"재무\""));
+}
+
