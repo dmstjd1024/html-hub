@@ -20,7 +20,7 @@ use std::{
 use time::{OffsetDateTime, UtcOffset};
 
 pub const MAX_BYTES: usize = 10 * 1024 * 1024;
-const LIST_LIMIT: i64 = 200;
+const PAGE_SIZE: i64 = 50;
 
 pub struct Comment {
     pub id: i64,
@@ -280,7 +280,8 @@ impl Docs {
     /// 제목, 올린 사람, 본문(현재 버전의 보이는 글자)에 검색어가 든 문서를 최신순으로 돌려준다. `project` 가 비어 있지 않으면 그 프로젝트만.
     /// LIKE 대신 instr 를 써서 검색어의 % 나 _ 가 특수문자로 해석되지 않게 한다.
     /// shortcut: 본문을 전부 훑는다. 문서가 수천 건을 넘어 느려지면 FTS5(trigram)로 바꾼다.
-    pub fn list(&self, q: &str, project: &str) -> Result<Vec<Doc>> {
+    /// `offset` 부터 한 쪽(PAGE_SIZE)을 돌려주되, 다음 쪽이 있는지 알 수 있게 한 개 더 가져온다.
+    pub fn list(&self, q: &str, project: &str, offset: i64) -> Result<Vec<Doc>> {
         let conn = self.db.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, title, project, uploader_email, uploader_name, created_at
@@ -290,9 +291,9 @@ impl Docs {
                     OR EXISTS (SELECT 1 FROM bodies b WHERE b.doc_id = documents.id AND instr(lower(b.text), lower(?1)) > 0))
                AND (?2 = '' OR project = ?2)
              ORDER BY created_at DESC, rowid DESC
-             LIMIT ?3",
+             LIMIT ?3 OFFSET ?4",
         )?;
-        let rows = stmt.query_map(params![q, project, LIST_LIMIT], row_to_doc)?;
+        let rows = stmt.query_map(params![q, project, PAGE_SIZE + 1, offset], row_to_doc)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -415,6 +416,7 @@ fn server_error(what: &str, e: impl std::fmt::Display) -> Response {
 pub struct ListQuery {
     q: Option<String>,
     project: Option<String>,
+    page: Option<i64>,
 }
 
 pub async fn index(
@@ -428,10 +430,30 @@ pub async fn index(
     };
     let q = query.q.unwrap_or_default();
     let project = query.project.unwrap_or_default();
-    let (docs, projects) = match (app.docs.list(q.trim(), &project), app.docs.projects()) {
+    // 큰 수를 넣어도 곱셈이 넘치지 않게 상한을 둔다.
+    let page_no = query.page.unwrap_or(1).clamp(1, 1_000_000);
+    let (mut docs, projects) = match (app.docs.list(q.trim(), &project, (page_no - 1) * PAGE_SIZE), app.docs.projects()) {
         (Ok(d), Ok(p)) => (d, p),
         (Err(e), _) | (_, Err(e)) => return server_error("목록 조회", e),
     };
+    let has_next = docs.len() as i64 > PAGE_SIZE;
+    docs.truncate(PAGE_SIZE as usize);
+    // 검색어·프로젝트를 숨은 칸으로 넘겨 브라우저가 주소를 인코딩하게 한다.
+    let nav_button = |n: i64, label: &str| {
+        format!(
+            "<form method=\"get\" action=\"/\" style=\"display:inline\">\
+             <input type=\"hidden\" name=\"q\" value=\"{}\"><input type=\"hidden\" name=\"project\" value=\"{}\">\
+             <button name=\"page\" value=\"{n}\">{label}</button></form> ",
+            escape(&q),
+            escape(&project),
+        )
+    };
+    let nav = format!(
+        "<div id=\"pages\">{}{}쪽 {}</div>",
+        if page_no > 1 { nav_button(page_no - 1, "이전") } else { String::new() },
+        page_no,
+        if has_next { nav_button(page_no + 1, "다음") } else { String::new() },
+    );
 
     let options: String = projects
         .iter()
@@ -471,7 +493,7 @@ pub async fn index(
          <input name=\"q\" value=\"{}\" placeholder=\"제목, 올린 사람, 본문\"> \
          <select name=\"project\"><option value=\"\">모든 프로젝트</option>{options}</select> \
          <button>검색</button></form>\
-         <table><tr><th>제목</th><th>프로젝트</th><th>올린 사람</th><th>올린 시각</th><th></th></tr>{rows}</table>{empty}",
+         <table><tr><th>제목</th><th>프로젝트</th><th>올린 사람</th><th>올린 시각</th><th></th></tr>{rows}</table>{empty}{nav}",
         escape(&user.name),
         escape(&q),
     ))
@@ -929,11 +951,11 @@ mod tests {
         let (d, dir) = docs();
         d.insert("월간 보고", "A", &user("a@x.im", "가나"), b"1").unwrap();
         d.insert("설계 메모", "B", &user("b@x.im", "다라"), b"2").unwrap();
-        assert_eq!(d.list("", "").unwrap().len(), 2);
-        assert_eq!(d.list("보고", "").unwrap()[0].title, "월간 보고");
-        assert_eq!(d.list("다라", "").unwrap()[0].title, "설계 메모");
-        assert_eq!(d.list("", "A").unwrap().len(), 1);
-        assert_eq!(d.list("%", "").unwrap().len(), 0, "% 는 특수문자가 아니라 글자로 찾는다");
+        assert_eq!(d.list("", "", 0).unwrap().len(), 2);
+        assert_eq!(d.list("보고", "", 0).unwrap()[0].title, "월간 보고");
+        assert_eq!(d.list("다라", "", 0).unwrap()[0].title, "설계 메모");
+        assert_eq!(d.list("", "A", 0).unwrap().len(), 1);
+        assert_eq!(d.list("%", "", 0).unwrap().len(), 0, "% 는 특수문자가 아니라 글자로 찾는다");
         assert_eq!(d.projects().unwrap(), ["A", "B"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -943,7 +965,7 @@ mod tests {
         let (d, dir) = docs();
         d.insert("첫째", "", &user("a@x.im", "가나"), b"1").unwrap();
         d.insert("둘째", "", &user("a@x.im", "가나"), b"2").unwrap();
-        assert_eq!(d.list("", "").unwrap()[0].title, "둘째");
+        assert_eq!(d.list("", "", 0).unwrap()[0].title, "둘째");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -953,7 +975,7 @@ mod tests {
         let id = d.insert("지울 것", "A", &user("a@x.im", "가나"), b"x").unwrap();
         d.hide(&id).unwrap();
         assert!(d.get(&id).unwrap().is_none());
-        assert!(d.list("", "").unwrap().is_empty());
+        assert!(d.list("", "", 0).unwrap().is_empty());
         assert!(d.projects().unwrap().is_empty());
         assert_eq!(d.read(&id).unwrap(), b"x");
         std::fs::remove_dir_all(dir).unwrap();
@@ -1025,15 +1047,15 @@ mod tests {
         let (d, dir) = docs();
         let a = user("a@x.im", "가나");
         let id = d.insert("보고", "", &a, "<p>분기 매출 요약</p><script>토큰</script>".as_bytes()).unwrap();
-        assert_eq!(d.list("매출", "").unwrap().len(), 1);
-        assert_eq!(d.list("토큰", "").unwrap().len(), 0, "script 안의 글자는 찾지 않는다");
+        assert_eq!(d.list("매출", "", 0).unwrap().len(), 1);
+        assert_eq!(d.list("토큰", "", 0).unwrap().len(), 0, "script 안의 글자는 찾지 않는다");
         d.replace(&id, &a, "<p>새 내용</p>".as_bytes()).unwrap();
-        assert_eq!(d.list("매출", "").unwrap().len(), 0, "이전 버전 본문은 색인하지 않는다");
-        assert_eq!(d.list("새 내용", "").unwrap().len(), 1);
+        assert_eq!(d.list("매출", "", 0).unwrap().len(), 0, "이전 버전 본문은 색인하지 않는다");
+        assert_eq!(d.list("새 내용", "", 0).unwrap().len(), 1);
         d.restore(&id, 1, &a).unwrap();
-        assert_eq!(d.list("매출", "").unwrap().len(), 1);
+        assert_eq!(d.list("매출", "", 0).unwrap().len(), 1);
         d.hide(&id).unwrap();
-        assert_eq!(d.list("매출", "").unwrap().len(), 0, "숨긴 문서는 본문으로도 안 나온다");
+        assert_eq!(d.list("매출", "", 0).unwrap().len(), 0, "숨긴 문서는 본문으로도 안 나온다");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1050,6 +1072,22 @@ mod tests {
         assert_eq!(d.comments(&id).unwrap().len(), 1);
         assert!(d.comment(&id, list[0].id).unwrap().is_none());
         assert!(d.comment("다른문서", list[1].id).unwrap().is_none(), "다른 문서의 댓글 번호로는 못 찾는다");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn 목록은_쪽마다_나뉘고_다음_쪽이_있는지_한_개_더_알려준다() {
+        let (d, dir) = docs();
+        let a = user("a@x.im", "가나");
+        for i in 0..PAGE_SIZE + 3 {
+            d.insert(&format!("문서{i}"), "", &a, b"x").unwrap();
+        }
+        let first = d.list("", "", 0).unwrap();
+        assert_eq!(first.len() as i64, PAGE_SIZE + 1, "다음 쪽이 있으면 한 개 더 온다");
+        assert_eq!(first[0].title, format!("문서{}", PAGE_SIZE + 2));
+        let second = d.list("", "", PAGE_SIZE).unwrap();
+        assert_eq!(second.len(), 3);
+        assert_eq!(second[2].title, "문서0");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
