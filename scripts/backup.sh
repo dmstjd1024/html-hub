@@ -31,6 +31,19 @@ if [ -f "$PURGED" ]; then
   done < "$PURGED"
 fi
 
+# 선택: 바깥(R2)으로 — 최신 DB 스냅샷과 파일을 묶어 암호화한 뒤 Worker(ops/worker)로 올린다. 30개를 남긴다.
+# shortcut: 묶음 하나로 올리므로 Worker 요청 한도(무료 100MB)를 넘으면 실패해 알림이 온다. 그때 파일을 나눠 올린다.
+if [ -n "${BACKUP_UPLOAD_URL:-}" ]; then
+  : "${BACKUP_UPLOAD_SECRET:?}" "${BACKUP_KEY_FILE:?}"
+  latest="$(ls -1 "$BACKUP_DIR"/db/html-hub-*.db | sort | tail -n 1)"
+  name="html-hub-$(date +%Y%m%d-%H%M%S).tar.gz.enc"
+  tmp="$(mktemp)"
+  tar -czf - -C "$BACKUP_DIR" "db/$(basename "$latest")" files \
+    | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass "file:$BACKUP_KEY_FILE" -out "$tmp"
+  curl -fsS -m 300 -X PUT -H "Authorization: Bearer $BACKUP_UPLOAD_SECRET" --data-binary "@$tmp" "$BACKUP_UPLOAD_URL/backup/$name" >/dev/null
+  rm -f "$tmp"
+fi
+
 if [ -n "${BACKUP_REMOTE:-}" ]; then
   # 로컬 백업 폴더가 기준이다. 완전 삭제와 오래된 DB 스냅샷 정리를 원격에도 따라가게 한다.
   rsync -a --delete "$BACKUP_DIR/" "$BACKUP_REMOTE"

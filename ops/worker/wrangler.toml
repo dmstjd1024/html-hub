@@ -1,0 +1,18 @@
+# html-hub 바깥 감시 + 원격 백업 받는 곳 (Cloudflare Worker). 배포: npx wrangler deploy (이 폴더에서)
+# 비밀값(wrangler secret put): UPLOAD_SECRET(백업), CHECK_SECRET(감시 호출), TG_TOKEN, TG_CHAT
+# 감시 시계는 GitHub Actions 다 (.github/workflows/monitor.yml). 계정의 크론 한도(무료 5개)를 다른 Worker 가 쓰고 있다.
+name = "html-hub-ops"
+main = "index.js"
+compatibility_date = "2026-11-01"
+workers_dev = true
+
+[triggers]
+crons = []
+
+[[r2_buckets]]
+binding = "BACKUPS"
+bucket_name = "html-hub-backups"
+
+[vars]
+HEALTH_URL = "https://survey.eunseong.dev/healthz"
+KEEP = "30"
