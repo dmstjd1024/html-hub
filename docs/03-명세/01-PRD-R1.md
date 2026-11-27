@@ -275,3 +275,22 @@ Claude 가 흔히 만드는 꼴 4가지(Chart.js 대시보드, Tailwind CDN, Rea
 
 - 이때 발견: 모든 문서에서 `SecurityError: Blocked a frame with origin "null"` 가 났다. 원인은 앱이나 문서가 아니라 Cloudflare 가 응답에 끼워 넣은 스크립트(Web Analytics beacon, JavaScript Detections)였다. 이 스크립트가 숨은 iframe 의 문서를 읽으려다 격리(sandbox) 때문에 막힌다.
 - 고친 방법: 올린 문서 응답에만 `Cache-Control: no-transform` 을 붙여 Cloudflare 가 문서 내용을 바꾸지 않게 했다. 앱 화면은 그대로 둔다. 대신 이 응답은 Cloudflare 압축을 받지 않는다 (문서는 10MB 이하라 감수한다).
+
+## Claude 아티팩트 유형별 지원 (2026-11-27)
+
+claude.ai 아티팩트 6가지 유형을 실서버에서 하나씩 올려 봤다. 원래는 HTML 만 받았고, 지금은 아래처럼 받는다.
+
+| 유형 (내려받은 파일) | 처리 |
+|---|---|
+| HTML (`.html`, `.htm`) | 그대로 저장. Claude Code·Claude Design 결과물도 이 꼴 |
+| Markdown (`.md`) | 서버에서 HTML 로 그려 저장 (표·취소선·체크박스, ```mermaid 블록은 도표로). 본문 검색에 걸린다 |
+| SVG (`.svg`) | XML 선언을 떼고 HTML 가운데에 넣는다 |
+| Mermaid (`.mmd`, `.mermaid`) | mermaid 11 로 그리는 HTML 로 감싼다 |
+| React (`.jsx`) | `export default` 컴포넌트를 그린다. 브라우저에서 Babel 로 JSX 를 바꾸고 react·recharts·lucide-react·lodash·d3·mathjs·papaparse·three·chart.js·xlsx 는 import map 으로 esm.sh 에서 받는다. Tailwind 포함 |
+| 코드 (`.py` 등) | 받지 않는다 (가정: 공유할 문서가 아니다) |
+
+- 감싸는 일은 올리기·토큰 올리기·새 버전 올리기가 함께 쓰는 `check_file` 한 곳에서 한다. 감싼 결과도 다른 문서처럼 격리해 내보낸다. UTF-8 이 아닌 파일은 거절한다.
+- 안 되는 것: `.jsx` 에서 shadcn/ui(`@/components/ui/*`) 를 쓰면 화면에 "실행하지 못했습니다" 와 오류를 보여 준다. claude.ai 전용 기능(`window.storage`, `window.claude.complete`, `window.fs`)은 어느 유형에서도 없다.
+- HTML 안의 브라우저 기능 점검(실서버): 저장소(메모리 대체), `pushState`, 외부 fetch, ES 모듈·import map, Worker, WebAssembly, WebGL, 오디오, crypto, 복사(클릭 시), 전체 화면, 외부 iframe, 구글 폰트가 된다. 라이브러리는 Chart.js, d3, Plotly, p5, three.js, KaTeX, highlight.js, Alpine, lucide, GSAP, PapaParse, SheetJS, Tone, Tailwind, Mermaid, React+Recharts 가 그려졌다.
+- 격리(출처 null) 때문에 안 되는 것: IndexedDB, 쿠키, Service Worker, 새로고침 뒤에도 남는 localStorage, OpenStreetMap 지도 타일(브라우저가 Referer 를 안 보내 OSM 이 차단 이미지를 준다. `Referrer-Policy` 를 바꿔도 같아서 되돌렸다). 풀려면 문서를 별도 도메인에서 내보내야 한다.
+- 확인: 단위 32개(변환 4개 추가)·E2E 17개(.md 올리기·그리기·본문 검색, .svg·.mmd·.jsx 받기 추가) 통과. 실서버에서 `.jsx`(Recharts 막대 4개·lucide 아이콘·버튼 상태), `.md`(표·체크박스·mermaid·인용), `.svg`, `.mermaid` 가 그려졌고 375px 에서 가로 넘침이 없다.

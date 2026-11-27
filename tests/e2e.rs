@@ -298,9 +298,9 @@ async fn r1_1_올리기_화면과_입력_검사() {
     let long_title = "가".repeat(201);
     let cases: Vec<(&str, Option<(&str, Vec<u8>)>, &str)> = vec![
         ("", Some(("a.html", html.to_vec())), "제목을 입력해 주세요"),
-        ("제목", Some(("a.txt", html.to_vec())), ".html 파일만"),
-        ("제목", Some(("a.html", vec![])), "HTML 파일을 선택해 주세요"),
-        ("제목", None, "HTML 파일을 선택해 주세요"),
+        ("제목", Some(("a.txt", html.to_vec())), ".html, .md, .svg, .mmd, .jsx 파일만"),
+        ("제목", Some(("a.html", vec![])), "파일을 선택해 주세요"),
+        ("제목", None, "파일을 선택해 주세요"),
         ("제목", Some(("big.html", vec![b'a'; MAX_BYTES + 1])), "10MB"),
         (&long_title, Some(("a.html", html.to_vec())), "200자"),
     ];
@@ -334,6 +334,19 @@ async fn r1_1_올리기_화면과_입력_검사() {
     // .htm 과 대문자 확장자도 받는다.
     let r = s.multipart("/upload", Some(&me), None, &[("title", "htm")], Some(("A.HTM", html))).await;
     assert_eq!(r.status, StatusCode::SEE_OTHER);
+
+    // Claude 아티팩트의 다른 유형은 HTML 로 감싸 저장한다. Markdown 은 서버에서 그려 본문 검색에도 걸린다.
+    let md = "# 회의록\n\n결정사항: 배포는 금요일\n".as_bytes();
+    let r = s.multipart("/upload", Some(&me), None, &[("title", "md")], Some(("note.md", md))).await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER);
+    let id = r.location().rsplit('/').next().unwrap().to_owned();
+    let body = original(&s.get(&format!("/d/{id}"), Some(&me)).await.body);
+    assert!(body.starts_with("<!doctype html>") && body.contains("<h1>회의록</h1>"), "{body}");
+    assert_eq!(listed_titles(&s.get("/?q=금요일", Some(&me)).await.body), ["md"]);
+    for name in ["a.svg", "a.mmd", "a.jsx"] {
+        let r = s.multipart("/upload", Some(&me), None, &[("title", name)], Some((name, b"<svg/>"))).await;
+        assert_eq!(r.status, StatusCode::SEE_OTHER, "{name}");
+    }
 }
 
 #[tokio::test]
@@ -761,7 +774,7 @@ async fn 올리기_오류가_나도_입력한_제목과_프로젝트는_남는�
         .multipart("/upload", Some(&s.login(OWNER)), None, &[("title", "분기 보고"), ("project", "재무")], Some(("a.txt", b"x")))
         .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
-    assert!(r.body.contains("role=\"alert\"") && r.body.contains(".html 파일만"));
+    assert!(r.body.contains("role=\"alert\"") && r.body.contains(".html, .md, .svg, .mmd, .jsx 파일만"));
     assert!(r.body.contains("value=\"분기 보고\"") && r.body.contains("value=\"재무\""));
 }
 

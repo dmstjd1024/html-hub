@@ -1,4 +1,5 @@
 mod auth;
+mod convert;
 mod docs;
 mod tokens;
 mod users;

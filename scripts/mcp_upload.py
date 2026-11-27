@@ -8,11 +8,11 @@ import json, os, sys, urllib.error, urllib.request, uuid
 
 TOOL = {
     "name": "upload_html",
-    "description": "로컬 .html 파일을 html-hub 에 올리고 공유 링크를 돌려준다. 올린 문서는 전 직원이 볼 수 있다.",
+    "description": "로컬 파일을 html-hub 에 올리고 공유 링크를 돌려준다. .html 외에 Claude 아티팩트 유형인 .md(Markdown), .svg, .mmd(Mermaid), .jsx(React 컴포넌트, export default) 도 받아 서버가 HTML 로 감싼다. 올린 문서는 전 직원이 볼 수 있다.",
     "inputSchema": {
         "type": "object",
         "properties": {
-            "file_path": {"type": "string", "description": "올릴 .html 파일의 절대 경로"},
+            "file_path": {"type": "string", "description": "올릴 파일의 절대 경로 (.html .htm .md .svg .mmd .mermaid .jsx)"},
             "title": {"type": "string", "description": "문서 제목"},
             "project": {"type": "string", "description": "프로젝트 이름 (선택)"},
         },
@@ -29,7 +29,7 @@ def upload(file_path, title, project=""):
     body = b""
     for name, value in (("title", title), ("project", project)):
         body += f'--{b}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
-    body += f'--{b}\r\nContent-Disposition: form-data; name="file"; filename="{os.path.basename(file_path)}"\r\nContent-Type: text/html\r\n\r\n'.encode()
+    body += f'--{b}\r\nContent-Disposition: form-data; name="file"; filename="{os.path.basename(file_path)}"\r\nContent-Type: application/octet-stream\r\n\r\n'.encode()
     body += data + f"\r\n--{b}--\r\n".encode()
     req = urllib.request.Request(
         base + "/api/upload", data=body, method="POST",

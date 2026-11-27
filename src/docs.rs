@@ -1034,14 +1034,15 @@ fn upload_form(app: &AppState, user: &crate::users::User, error: &str, values: (
                  <input id=\"project\" name=\"project\" list=\"projects\" maxlength=\"100\" value=\"{}\">\
                  <datalist id=\"projects\">{known}</datalist>\
                  <span class=\"hint\">비워 두면 미분류로 올라갑니다. 기존 프로젝트는 입력하면 제안됩니다.</span></div>\
-                 <div class=\"field\"><label for=\"file\">HTML 파일</label>\
-                 <input id=\"file\" type=\"file\" name=\"file\" accept=\".html,.htm\" required>\
-                 <span class=\"hint\">.html 또는 .htm, 10MB 이하</span></div>\
+                 <div class=\"field\"><label for=\"file\">파일</label>\
+                 <input id=\"file\" type=\"file\" name=\"file\" accept=\"{accept}\" required>\
+                 <span class=\"hint\">HTML, Markdown(.md), SVG, Mermaid(.mmd), React(.jsx) · 10MB 이하</span></div>\
                  <button class=\"btn\">올리기</button></form>\
                  <p class=\"lede\" style=\"margin-top:24px\">Claude에서 바로 올리려면 <a href=\"/tokens\">내 토큰</a>을 발급받으세요.</p>",
                 error_box(error),
                 escape(values.0),
                 escape(values.1),
+                accept = crate::convert::ACCEPT,
             ),
         ),
     )
@@ -1055,7 +1056,7 @@ pub async fn upload_page(State(app): State<AppState>, jar: PrivateCookieJar) -> 
     }
 }
 
-const BAD_FILE: &str = "파일이 너무 크거나 올바르지 않습니다. 10MB 이하의 HTML 파일만 올릴 수 있습니다.";
+const BAD_FILE: &str = "파일이 너무 크거나 올바르지 않습니다. 10MB 이하 파일만 올릴 수 있습니다.";
 
 pub struct Form {
     pub title: String,
@@ -1079,19 +1080,15 @@ pub async fn read_form(mut form: Multipart) -> Result<Form, &'static str> {
     Ok(out)
 }
 
-/// 올린 파일이 규칙(U3·U4)에 맞는지 본다. 맞으면 내용을 돌려준다.
-pub fn check_file(file: Option<(String, axum::body::Bytes)>) -> Result<axum::body::Bytes, &'static str> {
+/// 올린 파일이 규칙(U3·U4)에 맞는지 본다. 맞으면 저장할 HTML 을 돌려준다 (Markdown·SVG·Mermaid·JSX 는 HTML 로 감싼다).
+pub fn check_file(file: Option<(String, axum::body::Bytes)>) -> Result<Vec<u8>, &'static str> {
     let Some((filename, bytes)) = file.filter(|(_, b)| !b.is_empty()) else {
-        return Err("HTML 파일을 선택해 주세요.");
+        return Err("파일을 선택해 주세요.");
     };
-    let lower = filename.to_lowercase();
-    if !(lower.ends_with(".html") || lower.ends_with(".htm")) {
-        return Err(".html 파일만 올릴 수 있습니다.");
-    }
     if bytes.len() > MAX_BYTES {
         return Err("파일이 10MB 를 넘습니다.");
     }
-    Ok(bytes)
+    crate::convert::to_html(&filename, &bytes).unwrap_or(Err(".html, .md, .svg, .mmd, .jsx 파일만 올릴 수 있습니다."))
 }
 
 pub async fn upload(State(app): State<AppState>, jar: PrivateCookieJar, form: Multipart) -> Response {
@@ -1185,13 +1182,14 @@ fn replace_form(app: &AppState, user: &crate::users::User, doc: &Doc, error: &st
                 "{}<h2>새 버전 올리기</h2>\
                  <p class=\"lede\" style=\"margin-bottom:16px\">링크는 그대로이고 내용만 새 파일로 바뀝니다. 이전 버전은 이력에 남습니다.</p>\
                  <form class=\"form\" method=\"post\" action=\"/d/{id}/replace\" enctype=\"multipart/form-data\">{}\
-                 <div class=\"field\"><label for=\"file\">HTML 파일</label>\
-                 <input id=\"file\" type=\"file\" name=\"file\" accept=\".html,.htm\" required>\
-                 <span class=\"hint\">.html 또는 .htm, 10MB 이하</span></div>\
+                 <div class=\"field\"><label for=\"file\">파일</label>\
+                 <input id=\"file\" type=\"file\" name=\"file\" accept=\"{accept}\" required>\
+                 <span class=\"hint\">HTML, Markdown(.md), SVG, Mermaid(.mmd), React(.jsx) · 10MB 이하</span></div>\
                  <button class=\"btn\">새 버전 올리기</button></form>",
                 doc_header(app, doc, ""),
                 error_box(error),
                 id = escape(&doc.id),
+                accept = crate::convert::ACCEPT,
             ),
         ),
     )
