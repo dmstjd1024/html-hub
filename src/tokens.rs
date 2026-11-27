@@ -28,6 +28,9 @@ pub struct TokenInfo {
     pub last_used_at: Option<i64>,
 }
 
+/// OAuth 토큰 기한 (90일). 지나면 Claude 쪽에서 다시 연결한다.
+const OAUTH_TTL: i64 = 90 * 24 * 3600;
+
 fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
 }
@@ -45,6 +48,15 @@ impl Tokens {
                 hash TEXT PRIMARY KEY,
                 email TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
+                last_used_at INTEGER,
+                revoked_at INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS oauth_tokens (
+                hash TEXT PRIMARY KEY,
+                email TEXT NOT NULL,
+                client TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
                 last_used_at INTEGER,
                 revoked_at INTEGER
             )",
@@ -95,8 +107,52 @@ impl Tokens {
             .optional()?;
         if email.is_some() {
             conn.execute("UPDATE api_tokens SET last_used_at = ?2 WHERE hash = ?1", params![h, now_unix()])?;
+            return Ok(email);
+        }
+        // OAuth 로 연결한 도구(Claude 커넥터 등)의 토큰. 기한이 지나면 다시 연결해야 한다.
+        let email: Option<String> = conn
+            .query_row(
+                "SELECT email FROM oauth_tokens WHERE hash = ?1 AND revoked_at IS NULL AND expires_at > ?2",
+                params![h, now_unix()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if email.is_some() {
+            conn.execute("UPDATE oauth_tokens SET last_used_at = ?2 WHERE hash = ?1", params![h, now_unix()])?;
         }
         Ok(email)
+    }
+
+    /// OAuth 로 연결한 도구에 줄 토큰. 직원 토큰(hh_)과 따로 두어 서로를 폐기하지 않는다.
+    pub fn issue_oauth(&self, email: &str, client: &str) -> Result<String> {
+        let token = format!("hho_{}{}", CsrfToken::new_random().secret(), CsrfToken::new_random().secret());
+        let now = now_unix();
+        self.0.lock().unwrap().execute(
+            "INSERT INTO oauth_tokens (hash, email, client, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![hash(&token), email, client, now, now + OAUTH_TTL],
+        )?;
+        Ok(token)
+    }
+
+    /// 그 사람이 OAuth 로 연결한, 아직 살아 있는 도구들 (최근 연결순).
+    pub fn connections(&self, email: &str) -> Result<Vec<(String, TokenInfo)>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT client, created_at, last_used_at FROM oauth_tokens \
+             WHERE email = ?1 AND revoked_at IS NULL AND expires_at > ?2 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![email, now_unix()], |r| {
+            Ok((r.get(0)?, TokenInfo { created_at: r.get(1)?, last_used_at: r.get(2)? }))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn revoke_oauth(&self, email: &str) -> Result<()> {
+        self.0.lock().unwrap().execute(
+            "UPDATE oauth_tokens SET revoked_at = ?2 WHERE email = ?1 AND revoked_at IS NULL",
+            params![email, now_unix()],
+        )?;
+        Ok(())
     }
 
     pub fn info(&self, email: &str) -> Result<Option<TokenInfo>> {
@@ -152,6 +208,35 @@ pub async fn tokens_page(State(app): State<AppState>, jar: PrivateCookieJar) -> 
         None => "<section class=\"panel\"><h2>발급된 토큰이 없습니다</h2>\
                  <p class=\"quiet\">발급하면 Claude나 터미널에서 이 사이트로 바로 올릴 수 있습니다.</p></section>".into(),
     };
+    let base = escape(app.base_url.trim_end_matches('/'));
+    let connections = match app.tokens.connections(&user.email) {
+        Ok(c) if c.is_empty() => "<p class=\"quiet\">연결된 곳이 없습니다.</p>".to_owned(),
+        Ok(c) => format!(
+            "<ul class=\"quiet\">{}</ul>\
+             <form method=\"post\" action=\"/tokens/connections/revoke\" \
+             onsubmit=\"return confirm('Claude 연결을 모두 끊을까요? 다시 쓰려면 Claude 에서 다시 연결해야 합니다.')\">\
+             <button class=\"link danger\">모두 끊기</button></form>",
+            c.iter()
+                .map(|(client, i)| format!(
+                    "<li>{}: 연결 {}, 마지막 사용 {}</li>",
+                    escape(client),
+                    show_time(i.created_at),
+                    i.last_used_at.map_or("없음".into(), show_time)
+                ))
+                .collect::<String>()
+        ),
+        Err(e) => {
+            eprintln!("연결 조회 실패: {e}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let claude = format!(
+        "<section class=\"panel\"><h2>Claude 에 연결하기</h2>\
+         <p class=\"quiet\">claude.ai·Claude 데스크톱 앱: 설정 → 커넥터 → 사용자 지정 커넥터 추가에서 주소 <code>{base}/mcp</code> 를 넣고 연결하면 이 사이트 로그인 뒤 허용 화면이 뜹니다. \
+         그다음 Claude 에게 \"survey 에 올려줘\" 라고 하면 됩니다.</p>\
+         <p class=\"quiet\">Claude Code: <code>claude mcp add --transport http survey {base}/mcp</code> 뒤 <code>/mcp</code> 에서 로그인합니다.</p>\
+         <h2 style=\"margin-top:16px\">연결된 곳</h2>{connections}</section>"
+    );
     shell(
         &app,
         &user,
@@ -161,7 +246,7 @@ pub async fn tokens_page(State(app): State<AppState>, jar: PrivateCookieJar) -> 
              <p class=\"lede\">도구가 문서를 올릴 때 쓰는 열쇠입니다. 이 토큰으로 올린 문서는 {} 님이 올린 것으로 기록되니 남에게 알려 주지 마세요.</p></div></div>\
              <div class=\"form\">{state}\
              <form method=\"post\" action=\"/tokens\"><button class=\"btn\">새 토큰 발급</button></form>\
-             <p class=\"lede\" style=\"margin-top:8px;font-size:13px\">새로 발급하면 이전 토큰은 바로 폐기됩니다.</p></div>",
+             <p class=\"lede\" style=\"margin-top:8px;font-size:13px\">새로 발급하면 이전 토큰은 바로 폐기됩니다.</p>{claude}</div>",
             escape(&user.name)
         ),
     )
@@ -205,6 +290,23 @@ pub async fn tokens_revoke(State(app): State<AppState>, jar: PrivateCookieJar) -
         Ok(()) => Redirect::to("/tokens").into_response(),
         Err(e) => {
             eprintln!("토큰 폐기 실패: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+pub async fn connections_revoke(State(app): State<AppState>, jar: PrivateCookieJar) -> Response {
+    let user = match current_user(&app, &jar) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    match app.tokens.revoke_oauth(&user.email) {
+        Ok(()) => {
+            eprintln!("Claude 연결 모두 끊음: {}", user.email);
+            Redirect::to("/tokens").into_response()
+        }
+        Err(e) => {
+            eprintln!("연결 끊기 실패: {e}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }

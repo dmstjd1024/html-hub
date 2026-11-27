@@ -294,3 +294,15 @@ claude.ai 아티팩트 6가지 유형을 실서버에서 하나씩 올려 봤다
 - HTML 안의 브라우저 기능 점검(실서버): 저장소(메모리 대체), `pushState`, 외부 fetch, ES 모듈·import map, Worker, WebAssembly, WebGL, 오디오, crypto, 복사(클릭 시), 전체 화면, 외부 iframe, 구글 폰트가 된다. 라이브러리는 Chart.js, d3, Plotly, p5, three.js, KaTeX, highlight.js, Alpine, lucide, GSAP, PapaParse, SheetJS, Tone, Tailwind, Mermaid, React+Recharts 가 그려졌다.
 - 격리(출처 null) 때문에 안 되는 것: IndexedDB, 쿠키, Service Worker, 새로고침 뒤에도 남는 localStorage, OpenStreetMap 지도 타일(브라우저가 Referer 를 안 보내 OSM 이 차단 이미지를 준다. `Referrer-Policy` 를 바꿔도 같아서 되돌렸다). 풀려면 문서를 별도 도메인에서 내보내야 한다.
 - 확인: 단위 32개(변환 4개 추가)·E2E 17개(.md 올리기·그리기·본문 검색, .svg·.mmd·.jsx 받기 추가) 통과. 실서버에서 `.jsx`(Recharts 막대 4개·lucide 아이콘·버튼 상태), `.md`(표·체크박스·mermaid·인용), `.svg`, `.mermaid` 가 그려졌고 375px 에서 가로 넘침이 없다.
+
+## 원격 MCP 와 Claude 연결 (2026-11-27)
+
+로컬 MCP 스크립트는 PC 의 파일 경로만 받아 Claude Code 에서만 쓸 수 있었다. claude.ai 웹·데스크톱·모바일에서도 "survey 에 올려줘" 로 올릴 수 있게 원격 MCP 를 붙였다.
+
+- 연결: claude.ai 설정 → 커넥터 → 사용자 지정 커넥터 추가에 `https://survey.eunseong.dev/mcp`. Claude Code 는 `claude mcp add --transport http survey https://survey.eunseong.dev/mcp` 뒤 `/mcp` 에서 로그인. 직원 토큰(hh_)을 `Authorization: Bearer` 로 줘도 된다.
+- 로그인(OAuth 2.1): 메타데이터 → 동적 등록 → 승인 화면(구글 로그인 뒤 "허용") → 토큰 교환. PKCE(S256) 필수, 승인 코드는 10분·한 번만, 토큰은 90일이고 해시만 저장한다. 직원 토큰과 따로 두어 서로 폐기하지 않는다.
+- 돌아갈 주소는 `https://claude.ai/api/mcp/auth_callback`, `https://claude.com/api/mcp/auth_callback`, 이 컴퓨터(localhost·127.0.0.1)만 받는다 (가정: 다른 MCP 클라이언트는 아직 필요 없다). 그래서 등록한 클라이언트를 저장하지 않는다. 승인 화면에는 클라이언트가 보낸 이름이 아니라 돌아갈 주소로 정한 이름(Claude (claude.ai) / 이 컴퓨터의 프로그램)을 보여 준다.
+- 승인 화면은 다른 사이트가 겹쳐 띄우지 못하게 했고(`X-Frame-Options: DENY`), 허용 버튼은 이 사이트 화면에서 보낸 요청만 받는다. 허용하려면 "내가 Claude 에서 직접 연결을 눌렀다" 확인란을 따로 체크해야 한다 (보안 검토: 남이 시작한 claude.ai 연결 링크를 문서 속 새 창이나 메시지로 열게 해 엉겁결에 허용하게 만드는 공격을 줄인다). 배치 요청은 오류로 답하고, 로그인 뒤 돌아갈 승인 주소는 2048자까지 받는다. 연결은 내 토큰 화면의 "연결된 곳"에서 모두 끊을 수 있다. 명단에서 빠진 직원의 토큰은 살아 있어도 막는다.
+- 도구 `upload_html`: title, content, format(html·md·svg·mermaid·jsx), project. 아티팩트 내용을 그대로 넘긴다. 로컬 스크립트도 같은 입력(content·format)을 받고 file_path 도 그대로 받는다.
+- 확인: E2E 18개(원격 MCP·OAuth 전 과정 추가: 메타데이터, 401 안내, 이상한 돌아갈 주소 거절, 로그인 뒤 승인 화면 복귀, 거절·허용, 코드 재사용·PKCE 틀림 거절, 초기화·목록·올리기, 직원 토큰, 연결 끊기)·단위 34개 통과. 실서버에서 Claude Code 와 같은 방식(이 컴퓨터로 돌아오는 주소)으로 등록 → 휴대폰 폭 승인 화면에서 허용 → 토큰 → `.jsx` 올리기까지 됐다 (시험 토큰은 폐기). 로컬 스크립트의 content 올리기도 실서버에서 됐다.
+- 확인 못 한 것: claude.ai 의 실제 커넥터 연결. Cloudflare 봇 차단이 claude.ai 서버의 요청을 막는지는 사용자가 커넥터를 추가해 봐야 안다.

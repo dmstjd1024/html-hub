@@ -811,3 +811,141 @@ async fn 다른_출처나_격리된_문서에서_온_post_는_거절한다() {
     let r = s.multipart("/api/upload", None, Some(&token), &[("title", "도구")], Some(("a.html", b"<p>t</p>"))).await;
     assert_eq!(r.status, StatusCode::CREATED);
 }
+
+// ---------- 원격 MCP 와 OAuth ----------
+
+/// JSON 을 보낸다. 도구(Claude)처럼 Origin 은 붙이지 않는다.
+async fn send_json(s: &Server, path: &str, bearer: Option<&str>, body: serde_json::Value) -> Res {
+    let mut req = s.http.post(format!("{}{path}", s.base)).header(header::CONTENT_TYPE, "application/json").body(body.to_string());
+    if let Some(t) = bearer {
+        req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
+    }
+    s.send(req, None).await
+}
+
+/// 토큰 교환. 서버끼리 부르는 요청이라 Origin 이 없다.
+async fn exchange(s: &Server, fields: &[(&str, &str)]) -> Res {
+    let body: String = form_urlencoded::Serializer::new(String::new()).extend_pairs(fields).finish();
+    let req = s.http.post(format!("{}/oauth/token", s.base)).header(header::CONTENT_TYPE, "application/x-www-form-urlencoded").body(body);
+    s.send(req, None).await
+}
+
+fn rpc(id: i64, method: &str, params: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+}
+
+fn query_param(location: &str, key: &str) -> Option<String> {
+    openidconnect::url::Url::parse(location).unwrap().query_pairs().find(|(k, _)| k == key).map(|(_, v)| v.into_owned())
+}
+
+#[tokio::test]
+async fn 원격_mcp_는_oauth_로_연결해_올린다() {
+    use openidconnect::{PkceCodeChallenge, PkceCodeVerifier};
+    let s = Server::start().await;
+    let json = |r: &Res| serde_json::from_str::<serde_json::Value>(&r.body).unwrap_or_else(|_| panic!("JSON 아님: {}", r.body));
+
+    // 메타데이터로 로그인 위치를 알린다.
+    let meta = json(&s.get("/.well-known/oauth-authorization-server", None).await);
+    assert_eq!(meta["token_endpoint"], format!("{}/oauth/token", s.base));
+    assert_eq!(meta["code_challenge_methods_supported"][0], "S256");
+    assert_eq!(json(&s.get("/.well-known/oauth-protected-resource", None).await)["resource"], format!("{}/mcp", s.base));
+
+    // 토큰 없이 부르면 401 과 함께 메타데이터 위치를 알려 준다.
+    let init = rpc(1, "initialize", serde_json::json!({ "protocolVersion": "2025-06-18" }));
+    let r = send_json(&s, "/mcp", None, init.clone()).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    assert!(r.headers[header::WWW_AUTHENTICATE].to_str().unwrap().contains("/.well-known/oauth-protected-resource"));
+    assert_eq!(send_json(&s, "/mcp", Some("hho_wrong"), init.clone()).await.status, StatusCode::UNAUTHORIZED);
+
+    // 등록: 돌아갈 주소는 claude.ai 콜백과 이 컴퓨터만 받는다.
+    let cb = "https://claude.ai/api/mcp/auth_callback";
+    let evil = send_json(&s, "/oauth/register", None, serde_json::json!({ "redirect_uris": ["https://evil.com/cb"] })).await;
+    assert_eq!(evil.status, StatusCode::BAD_REQUEST);
+    let reg = send_json(&s, "/oauth/register", None, serde_json::json!({ "redirect_uris": [cb], "client_name": "Claude" })).await;
+    assert_eq!(reg.status, StatusCode::CREATED, "{}", reg.body);
+    let cid = json(&reg)["client_id"].as_str().unwrap().to_owned();
+
+    let verifier = "v".repeat(50);
+    let challenge = PkceCodeChallenge::from_code_verifier_sha256(&PkceCodeVerifier::new(verifier.clone())).as_str().to_owned();
+    let authorize = format!(
+        "/oauth/authorize?response_type=code&client_id={cid}&redirect_uri={}&code_challenge={challenge}&code_challenge_method=S256&state=xyz",
+        enc(cb)
+    );
+
+    // 로그인 전이면 로그인으로 보내고, 로그인 뒤 승인 화면으로 돌아온다.
+    let r = s.get(&authorize, None).await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER);
+    assert!(r.location().starts_with("/login?next=/oauth/authorize?") && r.location().contains("%26state=xyz"), "{}", r.location());
+
+    // 허용되지 않은 돌아갈 주소면 그리로 보내지 않고 멈춘다.
+    let me = s.login(OWNER);
+    let r = s.get(&authorize.replace(&enc(cb), &enc("https://evil.com/cb")), Some(&me)).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.location(), "");
+
+    // 승인 화면: 누가 어떤 계정으로 올리는지 보이고, 다른 사이트가 겹쳐 띄우지 못한다.
+    let r = s.get(&authorize, Some(&me)).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(r.body.contains("Claude (claude.ai)") && r.body.contains(OWNER), "{}", r.body);
+    assert_eq!(r.headers[header::X_FRAME_OPTIONS], "DENY");
+
+    let decide = |d: &'static str| {
+        let (cid, challenge) = (cid.clone(), challenge.clone());
+        let s = &s;
+        let me = me.clone();
+        async move {
+            s.post("/oauth/authorize", Some(&me), &[("client_id", &cid), ("redirect_uri", cb), ("code_challenge", &challenge), ("state", "xyz"), ("decision", d), ("confirm", "yes")])
+                .await
+        }
+    };
+    // 확인란 없이 누른 허용은 받지 않는다 (남이 띄운 창에서 엉겁결에 누른 클릭).
+    let r = s
+        .post("/oauth/authorize", Some(&me), &[("client_id", &cid), ("redirect_uri", cb), ("code_challenge", &challenge), ("state", "xyz"), ("decision", "allow")])
+        .await;
+    assert_eq!((r.status, r.location()), (StatusCode::BAD_REQUEST, ""));
+    let r = decide("deny").await;
+    assert_eq!(r.location(), format!("{cb}?error=access_denied&state=xyz"));
+
+    // 허용하면 코드를 주고, PKCE 가 맞아야 토큰으로 바꿔 준다. 코드는 한 번만 쓴다.
+    let code = query_param(decide("allow").await.location(), "code").unwrap();
+    let ok = [("grant_type", "authorization_code"), ("code", &code), ("redirect_uri", cb), ("client_id", &cid), ("code_verifier", &verifier)];
+    let r = exchange(&s, &ok).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let token = json(&r)["access_token"].as_str().unwrap().to_owned();
+    assert!(token.starts_with("hho_"));
+    assert_eq!(json(&exchange(&s, &ok).await)["error"], "invalid_grant", "같은 코드를 두 번 쓸 수 없다");
+    let code2 = query_param(decide("allow").await.location(), "code").unwrap();
+    let wrong = [("grant_type", "authorization_code"), ("code", &code2), ("redirect_uri", cb), ("client_id", &cid), ("code_verifier", &"w".repeat(50))];
+    assert_eq!(json(&exchange(&s, &wrong).await)["error"], "invalid_grant", "PKCE 가 틀리면 못 바꾼다");
+
+    // MCP: 초기화, 알림, 도구 목록, 올리기.
+    let r = send_json(&s, "/mcp", Some(&token), init).await;
+    assert_eq!(json(&r)["result"]["protocolVersion"], "2025-06-18");
+    let r = send_json(&s, "/mcp", Some(&token), serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).await;
+    assert_eq!(r.status, StatusCode::ACCEPTED);
+    let tools = json(&send_json(&s, "/mcp", Some(&token), rpc(2, "tools/list", serde_json::json!({}))).await);
+    assert_eq!(tools["result"]["tools"][0]["name"], "upload_html");
+    let call = |args: serde_json::Value| rpc(3, "tools/call", serde_json::json!({ "name": "upload_html", "arguments": args }));
+    let r = json(&send_json(&s, "/mcp", Some(&token), call(serde_json::json!({ "title": "회고", "content": "# 회고\n\n잘한 점", "format": "md", "project": "운영" }))).await);
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let url = r["result"]["content"][0]["text"].as_str().unwrap();
+    let id = url.strip_prefix(&format!("{}/d/", s.base)).expect("문서 링크를 돌려준다");
+    let who: String = s.db().query_row("SELECT uploader_email FROM documents WHERE id = ?1", [id], |r| r.get(0)).unwrap();
+    assert_eq!(who, OWNER, "승인한 사람 이름으로 올라간다");
+    assert!(original(&s.get(&format!("/d/{id}"), Some(&me)).await.body).contains("<h1>회고</h1>"));
+    let bad = json(&send_json(&s, "/mcp", Some(&token), call(serde_json::json!({ "title": "x", "content": "x", "format": "pdf" }))).await);
+    assert_eq!(bad["result"]["isError"], true);
+
+    // 직원 토큰(hh_)으로도 붙는다.
+    let staff = issue_token(&s, &me).await;
+    assert_eq!(json(&send_json(&s, "/mcp", Some(&staff), rpc(4, "ping", serde_json::json!({}))).await)["result"], serde_json::json!({}));
+
+    // 내 토큰 화면에 연결이 보이고, 끊으면 그 토큰은 더 못 쓴다. 직원 토큰은 그대로다.
+    assert!(s.get("/tokens", Some(&me)).await.body.contains("Claude (claude.ai)"));
+    assert_eq!(s.post("/tokens/connections/revoke", Some(&me), &[]).await.status, StatusCode::SEE_OTHER);
+    assert_eq!(send_json(&s, "/mcp", Some(&token), rpc(5, "ping", serde_json::json!({}))).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(send_json(&s, "/mcp", Some(&staff), rpc(6, "ping", serde_json::json!({}))).await.status, StatusCode::OK);
+    assert_eq!(s.get("/mcp", None).await.status, StatusCode::METHOD_NOT_ALLOWED);
+    let batch = send_json(&s, "/mcp", Some(&staff), serde_json::json!([rpc(7, "ping", serde_json::json!({}))])).await;
+    assert_eq!(json(&batch)["error"]["code"], -32600, "배치는 오류로 답한다");
+}

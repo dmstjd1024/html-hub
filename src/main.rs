@@ -1,6 +1,7 @@
 mod auth;
 mod convert;
 mod docs;
+mod mcp;
 mod tokens;
 mod users;
 
@@ -25,6 +26,7 @@ pub struct AppState {
     pub oidc: Arc<auth::Oidc>,
     pub key: Key,
     pub secure_cookies: bool,
+    pub grants: mcp::Grants,
 }
 
 impl FromRef<AppState> for Key {
@@ -35,11 +37,12 @@ impl FromRef<AppState> for Key {
 
 /// 상태를 바꾸는 요청(POST 등)은 이 사이트의 화면에서 보낸 것만 받는다 (위조 요청 방지).
 /// 격리된 문서 속 폼은 Origin: null 을 보내고, 다른 사이트는 자기 출처를 보낸다. 쿠키가 실려 와도 거절한다.
-/// 토큰으로 올리는 /api/upload 는 쿠키를 쓰지 않으므로 검사하지 않는다.
+/// 토큰으로 받는 /api/upload·/mcp 와 OAuth 토큰 교환·등록은 쿠키를 쓰지 않으므로 검사하지 않는다.
 async fn same_origin_only(State(origin): State<String>, req: Request, next: Next) -> Response {
     let reads = matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
     let from_here = req.headers().get(header::ORIGIN).is_some_and(|o| o.as_bytes() == origin.as_bytes());
-    if reads || from_here || req.uri().path() == "/api/upload" {
+    let tokens_only = matches!(req.uri().path(), "/api/upload" | "/mcp" | "/oauth/token" | "/oauth/register");
+    if reads || from_here || tokens_only {
         return next.run(req).await;
     }
     eprintln!("다른 출처의 요청 거절: {} {} (Origin {:?})", req.method(), req.uri().path(), req.headers().get(header::ORIGIN));
@@ -105,6 +108,15 @@ async fn main() -> Result<()> {
             "/api/upload",
             post(tokens::api_upload).layer(DefaultBodyLimit::max(docs::MAX_BYTES + 64 * 1024)),
         )
+        .route("/tokens/connections/revoke", post(tokens::connections_revoke))
+        // 원격 MCP 와 그 로그인(OAuth). 내용을 JSON 문자열로 받으므로 한도를 넉넉히 둔다.
+        .route("/mcp", post(mcp::mcp).layer(DefaultBodyLimit::max(docs::MAX_BYTES * 2 + 64 * 1024)))
+        .route("/.well-known/oauth-protected-resource", get(mcp::protected_resource))
+        .route("/.well-known/oauth-protected-resource/mcp", get(mcp::protected_resource))
+        .route("/.well-known/oauth-authorization-server", get(mcp::authorization_server))
+        .route("/oauth/register", post(mcp::register))
+        .route("/oauth/authorize", get(mcp::authorize).post(mcp::approve))
+        .route("/oauth/token", post(mcp::token))
         .route("/upload", get(docs::upload_page))
         // 파일 한도(10MB)에 다른 입력칸 몫만 더한다. 넘으면 업로드 처리에서 안내한다.
         .route(
@@ -134,6 +146,7 @@ async fn main() -> Result<()> {
             oidc: Arc::new(oidc),
             key: Key::from(session_key.as_bytes()),
             secure_cookies: base_url.starts_with("https://"),
+            grants: Default::default(),
         })
         .layer(middleware::from_fn_with_state(origin_of(&base_url), same_origin_only));
 

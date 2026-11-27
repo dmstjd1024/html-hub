@@ -416,8 +416,15 @@ pub struct LoginQuery {
     next: Option<String>,
 }
 
-/// 로그인 뒤 돌아갈 곳은 "/d/<문서번호>" 꼴만 받는다. 아무 주소나 받으면 다른 사이트로 보내는 통로가 된다.
+/// 로그인 뒤 돌아갈 곳은 "/d/<문서번호>" 와 Claude 연결 승인 화면("/oauth/authorize?...")만 받는다.
+/// 아무 주소나 받으면 다른 사이트로 보내는 통로가 된다.
 fn safe_next(next: &str) -> String {
+    if let Some(q) = next.strip_prefix("/oauth/authorize?") {
+        // 로그인 중 쿠키(4KB 한도)에 암호화해 담으므로 길이를 묶는다.
+        if q.len() <= 2048 && q.chars().all(|c| c.is_ascii_graphic() && c != '\\') {
+            return next.to_owned();
+        }
+    }
     match next.strip_prefix("/d/") {
         Some(id) if !id.is_empty() && id.len() <= 64
             && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') => next.to_owned(),
@@ -570,7 +577,9 @@ pub fn current_user(app: &AppState, jar: &PrivateCookieJar) -> Result<User, Resp
 /// `current_user` 와 같고, 로그인이 필요하면 로그인 뒤 `next` 로 돌아오게 보낸다.
 pub fn current_user_next(app: &AppState, jar: &PrivateCookieJar, next: &str) -> Result<User, Response> {
     let Some(email) = session_email(jar) else {
-        return Err(Redirect::to(&format!("/login?next={}", safe_next(next))).into_response());
+        // 승인 화면 주소에는 & 가 들어 있어 next 값 안에 넣을 때 바꿔 쓴다.
+        let next = safe_next(next).replace('%', "%25").replace('&', "%26").replace('+', "%2B").replace('#', "%23");
+        return Err(Redirect::to(&format!("/login?next={next}")).into_response());
     };
     // 로그인 뒤에 계정이 비활성화됐을 수 있으므로 매번 명단을 다시 본다.
     match app.users.find_active(&email) {
@@ -623,7 +632,10 @@ mod tests {
     #[test]
     fn 돌아갈_곳은_문서_주소만_받는다() {
         assert_eq!(safe_next("/d/abc-DEF_123"), "/d/abc-DEF_123");
-        for bad in ["", "/", "//evil.com", "https://evil.com", "/d/", "/d/a/b", "/d/../x", "/d/a?x=1", "/login", "/d//evil.com"] {
+        let oauth = "/oauth/authorize?client_id=x&redirect_uri=https%3A%2F%2Fclaude.ai%2Fapi%2Fmcp%2Fauth_callback";
+        assert_eq!(safe_next(oauth), oauth);
+        for bad in ["", "/", "//evil.com", "https://evil.com", "/d/", "/d/a/b", "/d/../x", "/d/a?x=1", "/login", "/d//evil.com",
+                    "/oauth/authorize", "/oauth/authorize?a b", "/oauth/authorize?a\\b", "/oauth/token?x=1"] {
             assert_eq!(safe_next(bad), "/", "{bad}");
         }
     }

@@ -6,30 +6,45 @@ Claude Code 등록 예: claude mcp add html-hub -e HTML_HUB_URL=... -e HTML_HUB_
 """
 import json, os, sys, urllib.error, urllib.request, uuid
 
+EXTS = {"html": "html", "md": "md", "svg": "svg", "mermaid": "mmd", "jsx": "jsx"}
+
 TOOL = {
     "name": "upload_html",
-    "description": "로컬 파일을 html-hub 에 올리고 공유 링크를 돌려준다. .html 외에 Claude 아티팩트 유형인 .md(Markdown), .svg, .mmd(Mermaid), .jsx(React 컴포넌트, export default) 도 받아 서버가 HTML 로 감싼다. 올린 문서는 전 직원이 볼 수 있다.",
+    "description": "survey(html-hub, 사내 HTML 문서 공유 사이트)에 문서를 올리고 공유 링크를 돌려준다. "
+                   "Claude 가 만든 아티팩트는 내용 전체를 content 에 넣고, 이미 파일로 있으면 file_path 를 준다. "
+                   ".html 외에 Markdown, SVG, Mermaid, React(.jsx, export default 컴포넌트)도 받아 서버가 HTML 로 감싼다. "
+                   "올린 문서는 전 직원이 볼 수 있다.",
     "inputSchema": {
         "type": "object",
         "properties": {
-            "file_path": {"type": "string", "description": "올릴 파일의 절대 경로 (.html .htm .md .svg .mmd .mermaid .jsx)"},
             "title": {"type": "string", "description": "문서 제목"},
+            "content": {"type": "string", "description": "문서 내용 전체 (file_path 대신)"},
+            "format": {"type": "string", "enum": list(EXTS), "description": "content 의 종류. 기본 html"},
+            "file_path": {"type": "string", "description": "올릴 파일의 절대 경로 (.html .htm .md .svg .mmd .mermaid .jsx)"},
             "project": {"type": "string", "description": "프로젝트 이름 (선택)"},
         },
-        "required": ["file_path", "title"],
+        "required": ["title"],
     },
 }
 
 
-def upload(file_path, title, project=""):
+def upload(title, project="", file_path=None, content=None, format="html"):
     base, token = os.environ["HTML_HUB_URL"].rstrip("/"), os.environ["HTML_HUB_TOKEN"]
-    with open(file_path, "rb") as f:
-        data = f.read()
+    if content:
+        if format not in EXTS:
+            raise ValueError(f"format 은 {', '.join(EXTS)} 중 하나입니다")
+        data, filename = content.encode(), f"artifact.{EXTS[format]}"
+    elif file_path:
+        with open(file_path, "rb") as f:
+            data = f.read()
+        filename = os.path.basename(file_path)
+    else:
+        raise ValueError("content 나 file_path 가 필요합니다")
     b = uuid.uuid4().hex
     body = b""
     for name, value in (("title", title), ("project", project)):
         body += f'--{b}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
-    body += f'--{b}\r\nContent-Disposition: form-data; name="file"; filename="{os.path.basename(file_path)}"\r\nContent-Type: application/octet-stream\r\n\r\n'.encode()
+    body += f'--{b}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\nContent-Type: application/octet-stream\r\n\r\n'.encode()
     body += data + f"\r\n--{b}--\r\n".encode()
     req = urllib.request.Request(
         base + "/api/upload", data=body, method="POST",
@@ -58,7 +73,7 @@ def handle(msg):
     if method == "tools/call":
         a = msg["params"].get("arguments", {})
         try:
-            url = upload(a["file_path"], a["title"], a.get("project", ""))
+            url = upload(a["title"], a.get("project", ""), a.get("file_path"), a.get("content"), a.get("format", "html"))
             return {"content": [{"type": "text", "text": url}]}
         except Exception as e:  # 도구 오류는 결과로 돌려줘 Claude 가 읽게 한다
             return {"content": [{"type": "text", "text": f"올리기 실패: {e}"}], "isError": True}
