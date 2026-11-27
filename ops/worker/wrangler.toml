@@ -1,17 +1,23 @@
 # html-hub 바깥 감시 + 원격 백업 받는 곳 (Cloudflare Worker). 배포: npx wrangler deploy (이 폴더에서)
-# 비밀값(wrangler secret put): UPLOAD_SECRET(백업), CHECK_SECRET(감시 호출), TG_TOKEN, TG_CHAT
-# 감시 시계는 GitHub Actions 다 (.github/workflows/monitor.yml). 계정의 크론 한도(무료 5개)를 다른 Worker 가 쓰고 있다.
+# 비밀값(wrangler secret put): UPLOAD_SECRET, TG_TOKEN, TG_CHAT
+# 감시 시계는 Durable Object 알람(Clock)이다. 계정의 크론 한도(무료 5개)를 다른 Worker 가 쓰고 있다.
+# 처음 배포한 뒤나 알람이 끊긴 것 같으면 인증된 요청을 한 번 보내면 다시 돈다 (POST /check).
 name = "html-hub-ops"
 main = "index.js"
 compatibility_date = "2026-11-01"
 workers_dev = true
 
-[triggers]
-crons = []
-
 [[r2_buckets]]
 binding = "BACKUPS"
 bucket_name = "html-hub-backups"
+
+[[durable_objects.bindings]]
+name = "CLOCK"
+class_name = "Clock"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Clock"]
 
 [vars]
 HEALTH_URL = "https://survey.eunseong.dev/healthz"

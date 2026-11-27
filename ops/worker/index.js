@@ -1,8 +1,11 @@
 // html-hub 바깥 감시와 원격 백업.
-// - 5분마다(GitHub Actions 가 POST /check) HEALTH_URL 을 본다. 두 번 연달아 실패하면 텔레그램, 회복하면 한 번 더. 맥미니가 통째로 꺼져도 잡는다.
+// - 5분마다(Durable Object 알람) HEALTH_URL 을 본다. 두 번 연달아 실패하면 텔레그램, 회복하면 한 번 더. 맥미니가 통째로 꺼져도 잡는다.
 // - 마지막 백업이 26시간보다 오래되면 알린다 (맥미니가 죽어 백업이 안 오는 경우).
 // - PUT /backup/<이름> 으로 맥미니가 암호화한 백업을 받아 R2 에 둔다. KEEP 개만 남긴다. GET /backup/latest 로 내려받는다.
 // 상태는 R2 의 monitor-state.json 한 파일에 둔다.
+import { DurableObject } from "cloudflare:workers";
+
+const EVERY_MS = 5 * 60 * 1000;
 const STATE = "monitor-state.json";
 const NAME = /^html-hub-\d{8}-\d{6}\.tar\.gz\.enc$/;
 
@@ -53,19 +56,37 @@ async function check(env) {
   }
 
   for (const n of notes) await telegram(env, n);
+  const previousAt = s.at ?? null;
+  s.at = new Date().toISOString();
   await env.BACKUPS.put(STATE, JSON.stringify(s));
-  return { ...s, newestBackup: latest ? { key: latest.key, at: new Date(newest).toISOString(), size: latest.size } : null, sent: notes.length };
+  return { ...s, previousAt, newestBackup: latest ? { key: latest.key, at: new Date(newest).toISOString(), size: latest.size } : null, sent: notes.length };
+}
+
+// 감시 시계. 계정의 크론 한도(무료 5개)를 다른 Worker 가 쓰고, GitHub 예약 실행은 돌지 않아 알람을 쓴다.
+export class Clock extends DurableObject {
+  // 알람이 없으면 건다. 인증된 요청(매일의 백업 올리기 포함)마다 불러, 끊겨도 다시 돈다.
+  async start() {
+    if ((await this.ctx.storage.getAlarm()) === null) await this.ctx.storage.setAlarm(Date.now() + EVERY_MS);
+  }
+
+  async alarm() {
+    // 다음 알람을 먼저 건다. 감시가 실패해도 시계는 멈추지 않는다 (던지면 재시도로 실패 횟수가 겹친다).
+    await this.ctx.storage.setAlarm(Date.now() + EVERY_MS);
+    try {
+      await check(this.env);
+    } catch (e) {
+      console.error("감시 실패", e);
+    }
+  }
 }
 
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
-    // 감시 호출(GitHub Actions)과 백업 올리기·받기는 비밀값을 따로 쓴다. 감시 비밀값이 새도 백업은 못 건드린다.
-    const isCheck = req.method === "POST" && url.pathname === "/check";
-    const secret = isCheck ? env.CHECK_SECRET : env.UPLOAD_SECRET;
-    if (!secret || req.headers.get("authorization") !== `Bearer ${secret}`) {
+    if (!env.UPLOAD_SECRET || req.headers.get("authorization") !== `Bearer ${env.UPLOAD_SECRET}`) {
       return new Response("unauthorized", { status: 401 });
     }
+    await env.CLOCK.get(env.CLOCK.idFromName("monitor")).start();
     if (req.method === "PUT" && url.pathname.startsWith("/backup/")) {
       const name = url.pathname.slice("/backup/".length);
       if (!NAME.test(name)) return new Response("bad name", { status: 400 });
@@ -87,13 +108,10 @@ export default {
       if (!obj) return new Response("not found", { status: 404 });
       return new Response(obj.body, { headers: { "content-disposition": `attachment; filename="${name}"` } });
     }
-    // 감시: GitHub Actions(.github/workflows/monitor.yml)가 5분마다 부른다. 계정의 크론 한도(무료 5개)를 다 써서다.
-    if (isCheck) {
+    // 손으로 감시를 한 번 돌려 상태를 본다 (previousAt 이 직전 감시 시각).
+    if (req.method === "POST" && url.pathname === "/check") {
       return Response.json(await check(env));
     }
     return new Response("not found", { status: 404 });
-  },
-  async scheduled(_event, env, ctx) {
-    ctx.waitUntil(check(env));
   },
 };
