@@ -306,3 +306,11 @@ claude.ai 아티팩트 6가지 유형을 실서버에서 하나씩 올려 봤다
 - 도구 `upload_html`: title, content, format(html·md·svg·mermaid·jsx), project. 아티팩트 내용을 그대로 넘긴다. 로컬 스크립트도 같은 입력(content·format)을 받고 file_path 도 그대로 받는다.
 - 확인: E2E 18개(원격 MCP·OAuth 전 과정 추가: 메타데이터, 401 안내, 이상한 돌아갈 주소 거절, 로그인 뒤 승인 화면 복귀, 거절·허용, 코드 재사용·PKCE 틀림 거절, 초기화·목록·올리기, 직원 토큰, 연결 끊기)·단위 34개 통과. 실서버에서 Claude Code 와 같은 방식(이 컴퓨터로 돌아오는 주소)으로 등록 → 휴대폰 폭 승인 화면에서 허용 → 토큰 → `.jsx` 올리기까지 됐다 (시험 토큰은 폐기). 로컬 스크립트의 content 올리기도 실서버에서 됐다.
 - 확인 못 한 것: claude.ai 의 실제 커넥터 연결. Cloudflare 봇 차단이 claude.ai 서버의 요청을 막는지는 사용자가 커넥터를 추가해 봐야 안다.
+
+## Codex 연결 (2026-11-27)
+
+Codex CLI 도 같은 원격 MCP(`/mcp`)에 붙는다. 서버 쪽은 바꿀 게 없었다 — Codex 의 OAuth 는 이 컴퓨터(`http://127.0.0.1:<포트>/callback/...`)로 돌아오고 동적 등록을 쓰는데, 둘 다 이미 받는다. 승인 화면 이름과 내 토큰 화면 안내에 Codex 를 넣었다.
+
+- 연결: `codex mcp add survey --url https://survey.eunseong.dev/mcp` — 추가하면서 바로 브라우저 로그인 → 허용 화면이 뜬다. 다시 로그인은 `codex mcp login survey`. 직원 토큰을 쓰려면 `--bearer-token-env-var HTML_HUB_TOKEN` 을 붙이고 그 환경변수에 `hh_` 토큰을 넣는다.
+- 확인 (codex-cli 0.172.0): 임시 설정 폴더에서 `codex mcp add` → 동적 등록 → 허용 → `Successfully logged in`, `codex mcp list` 에 `OAuth` 로 보인다. `codex exec` 를 OAuth·직원 토큰 두 방식으로 돌렸을 때 Codex 가 세션을 열며 `/mcp` 에 인증해 붙은 것을 토큰의 마지막 사용 시각으로 확인했다. 모델 호출은 이 맥미니의 Codex 로그인 파일(`~/.codex/auth.json`)이 깨져 있어(`trailing characters at line 17`) 못 했다 — 대화 중 도구 호출은 아직 시험 전.
+- 맥미니 Codex 에 실제로 등록했다(OAuth). `codex mcp add` 가 `~/.codex/config.toml` 을 다시 써서 키 순서와 표기(`120` → `120.0`, 빈 `args = []` 생략)가 바뀌었다. 뜻은 같다.

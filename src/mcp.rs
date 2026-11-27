@@ -1,4 +1,4 @@
-//! 원격 MCP 서버와 그 로그인(OAuth 2.1). claude.ai·Claude 데스크톱·모바일의 커넥터와 Claude Code 가 붙는다.
+//! 원격 MCP 서버와 그 로그인(OAuth 2.1). claude.ai·Claude 데스크톱·모바일의 커넥터와 Claude Code·Codex 가 붙는다.
 //! - MCP: `POST /mcp` (Streamable HTTP, 응답은 JSON 만). 도구는 upload_html 하나.
 //! - OAuth: 메타데이터, 동적 등록(DCR), 승인 화면, 토큰 교환. PKCE(S256) 필수.
 //!   돌아갈 주소는 claude.ai·claude.com 콜백과 이 컴퓨터(loopback)만 받으므로, 등록한 클라이언트를 따로 저장하지 않는다.
@@ -60,7 +60,7 @@ fn client_of(redirect_uri: &str) -> Option<&'static str> {
         && u.username().is_empty()
         && u.password().is_none()
         && u.fragment().is_none();
-    loopback.then_some("이 컴퓨터의 프로그램 (Claude Code 등)")
+    loopback.then_some("이 컴퓨터의 프로그램 (Claude Code·Codex 등)")
 }
 
 // ---------- OAuth ----------

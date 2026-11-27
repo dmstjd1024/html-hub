@@ -235,6 +235,8 @@ pub async fn tokens_page(State(app): State<AppState>, jar: PrivateCookieJar) -> 
          <p class=\"quiet\">claude.ai·Claude 데스크톱 앱: 설정 → 커넥터 → 사용자 지정 커넥터 추가에서 주소 <code>{base}/mcp</code> 를 넣고 연결하면 이 사이트 로그인 뒤 허용 화면이 뜹니다. \
          그다음 Claude 에게 \"survey 에 올려줘\" 라고 하면 됩니다.</p>\
          <p class=\"quiet\">Claude Code: <code>claude mcp add --transport http survey {base}/mcp</code> 뒤 <code>/mcp</code> 에서 로그인합니다.</p>\
+         <p class=\"quiet\">Codex: <code>codex mcp add survey --url {base}/mcp</code> 를 실행하면 브라우저에서 로그인 뒤 허용 화면이 뜹니다. \
+         다시 로그인할 때는 <code>codex mcp login survey</code>.</p>\
          <h2 style=\"margin-top:16px\">연결된 곳</h2>{connections}</section>"
     );
     shell(
