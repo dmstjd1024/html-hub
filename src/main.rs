@@ -55,10 +55,13 @@ async fn same_origin_only(State(origin): State<String>, req: Request, next: Next
     (StatusCode::FORBIDDEN, auth::page("다른 화면에서 보낸 요청이라 처리하지 않았습니다. <a href=\"/\">목록으로</a>")).into_response()
 }
 
-/// 로그인한 화면·CSV 가 Cloudflare 나 브라우저 공유 캐시에 남지 않게, 캐시 규칙을 따로 정하지 않은 응답은 저장하지 말라고 한다.
+/// 로그인한 화면·CSV 가 Cloudflare 나 브라우저 공유 캐시에 남지 않게 하고, 앱 화면을 남이 겹쳐 띄우지 못하게 한다.
+/// 캐시:, 캐시 규칙을 따로 정하지 않은 응답은 저장하지 말라고 한다.
 /// (Cloudflare 는 `.csv` 같은 확장자를 기본으로 캐시해, 응답 CSV 가 로그인 없이 새어 나갈 수 있었다.)
 async fn no_store(mut res: Response) -> Response {
     res.headers_mut().entry(header::CACHE_CONTROL).or_insert(header::HeaderValue::from_static("private, no-store"));
+    // 앱 화면을 다른 사이트나 올린 문서(출처 없음)가 iframe 으로 겹쳐 띄우지 못하게 한다. 앱 틀이 /raw 를 넣는 것은 같은 출처라 된다.
+    res.headers_mut().entry(header::X_FRAME_OPTIONS).or_insert(header::HeaderValue::from_static("SAMEORIGIN"));
     res
 }
 

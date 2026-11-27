@@ -397,6 +397,7 @@ async fn r1_2_링크로_열기() {
     let sandbox = frame.body.split("sandbox=\"").nth(1).unwrap().split('"').next().unwrap();
     assert!(sandbox.contains("allow-scripts") && !sandbox.contains("allow-same-origin") && !sandbox.contains("allow-top-navigation"), "{sandbox}");
     assert_eq!(frame.headers[header::CACHE_CONTROL], "private, no-store", "로그인 화면은 캐시하지 않는다");
+    assert_eq!(frame.headers[header::X_FRAME_OPTIONS], "SAMEORIGIN", "다른 사이트·올린 문서가 앱 화면을 겹쳐 띄우지 못한다");
     assert_eq!(s.get(&format!("/d/{id}/raw"), None).await.location(), format!("/login?next=/d/{id}"));
 
     // 다른 직원도 볼 수 있다 (프로젝트는 열람 범위를 나누지 않는다).

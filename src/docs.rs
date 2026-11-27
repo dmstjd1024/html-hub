@@ -514,12 +514,17 @@ impl Docs {
             tx.execute(&format!("DELETE FROM {table} WHERE doc_id = ?1"), [id])?;
         }
         tx.execute("DELETE FROM documents WHERE id = ?1", [id])?;
+        // 백업 정리용 목록을 먼저 쓴다. 못 쓰면 기록을 지우지 않고(되돌림) 다시 시도할 수 있게 한다.
+        {
+            use std::io::Write;
+            let mut list = std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join("..").join("purged.txt"))?;
+            for f in &files {
+                writeln!(list, "{f}")?;
+            }
+        }
         tx.commit()?;
         drop(conn);
-        use std::io::Write;
-        let mut list = std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join("..").join("purged.txt"))?;
         for f in &files {
-            writeln!(list, "{f}")?;
             // 파일이 이미 없으면 그대로 둔다. 기록은 지웠으므로 다시 보이지 않는다.
             let _ = std::fs::remove_file(self.dir.join(f));
         }

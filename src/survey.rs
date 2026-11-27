@@ -29,6 +29,7 @@ e.data.ok?ok(e.data.result):no(new Error(e.data.error))}\
 addEventListener('message',on);window.parent.postMessage({htmlhub:'submit',id:id,answers:answers},'*')})}};";
 
 /// 앱 틀에 붙는 확인 창과, 문서의 제출 요청을 받아 확인 뒤 내는 스크립트.
+/// 보낼 답은 전부 보여 준다. 창이 뜬 뒤 0.8초는 '제출' 을 막아, 문서가 유도한 두 번째 클릭이 바로 제출되지 않게 한다.
 pub fn confirm_dialog(name: &str) -> String {
     format!(
         "<dialog class=\"ask\" id=\"ask\" aria-labelledby=\"ask-h\"><h2 id=\"ask-h\">설문 응답을 제출할까요?</h2>\
@@ -41,8 +42,10 @@ pub fn confirm_dialog(name: &str) -> String {
          var reply=function(m){{m.htmlhub=e.data.id;f.contentWindow.postMessage(m,'*')}},a=e.data.answers;\
          if(!a||typeof a!=='object'||Array.isArray(a))return reply({{ok:false,error:'응답은 {{질문: 답}} 꼴의 객체여야 합니다.'}});\
          if(d.open)return reply({{ok:false,error:'다른 제출을 확인하는 중입니다.'}});\
-         ul.replaceChildren.apply(ul,Object.keys(a).slice(0,30).map(function(k){{var li=document.createElement('li');li.textContent=k+': '+text(a[k]);return li}}));\
-         d.returnValue='';d.showModal();\
+         ul.replaceChildren.apply(ul,Object.keys(a).map(function(k){{var li=document.createElement('li');li.textContent=k+': '+text(a[k]);return li}}));\
+         if(document.fullscreenElement)document.exitFullscreen();\
+         var b=d.querySelector('button[value=send]');b.disabled=true;d.returnValue='';d.showModal();\
+         setTimeout(function(){{b.disabled=false}},800);\
          var send=await new Promise(function(r){{d.addEventListener('close',function(){{r(d.returnValue==='send')}},{{once:true}})}});\
          if(!send)return reply({{ok:false,error:'제출을 취소했습니다.'}});\
          try{{var r=await fetch(location.pathname+'/responses',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{answers:a}})}});\

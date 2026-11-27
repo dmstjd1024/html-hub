@@ -28,6 +28,7 @@ if [ -f "$PURGED" ]; then
 fi
 
 if [ -n "${BACKUP_REMOTE:-}" ]; then
-  rsync -a "$BACKUP_DIR/" "$BACKUP_REMOTE"
+  # 로컬 백업 폴더가 기준이다. 완전 삭제와 오래된 DB 스냅샷 정리를 원격에도 따라가게 한다.
+  rsync -a --delete "$BACKUP_DIR/" "$BACKUP_REMOTE"
 fi
 echo "백업 완료: $(date '+%F %T')"
