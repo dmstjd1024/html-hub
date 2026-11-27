@@ -4,7 +4,8 @@
 name: monitor
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    # 정각은 GitHub 예약이 몰려 밀리거나 빠지기 쉬워 3분씩 비켜 잡는다.
+    - cron: "3-58/5 * * * *"
   workflow_dispatch:
 permissions: {}
 jobs:
