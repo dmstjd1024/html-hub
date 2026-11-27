@@ -13,4 +13,7 @@ jobs:
     timeout-minutes: 2
     steps:
       - name: Worker 감시 부르기
-        run: curl -fsS -m 60 -X POST -H "Authorization: Bearer ${{ secrets.MONITOR_SECRET }}" https://html-hub-ops.dmstjd1024.workers.dev/check
+        env:
+          MONITOR_SECRET: ${{ secrets.MONITOR_SECRET }}
+        run: |
+          curl -fsS -m 60 -X POST -H "Authorization: Bearer $MONITOR_SECRET" https://html-hub-ops.dmstjd1024.workers.dev/check
