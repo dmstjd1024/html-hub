@@ -1080,7 +1080,7 @@ fn upload_form(app: &AppState, user: &crate::users::User, error: &str, values: (
                  <button class=\"btn\">올리기</button></form>\
                  <p class=\"lede\" style=\"margin-top:24px\">Claude에서 바로 올리려면 <a href=\"/tokens\">내 토큰</a>을 발급받으세요.</p>\
                  <p class=\"lede\" style=\"margin-top:8px\">설문도 됩니다. 문서 스크립트에서 <code>window.htmlhub.submit({{질문: 답}})</code> 을 부르면 \
-                 응답이 직원 이름으로 모이고, 올린 사람이 문서의 '응답' 탭에서 봅니다.</p>",
+                 보는 사람이 확인한 뒤 그 사람 이름으로 응답이 모이고, 올린 사람이 문서의 '응답' 탭에서 봅니다.</p>",
                 error_box(error),
                 escape(values.0),
                 escape(values.1),
@@ -1516,25 +1516,47 @@ pub async fn uploaded(State(app): State<AppState>, jar: PrivateCookieJar, Path(i
     }
 }
 
+/// 문서 링크(`/d/<번호>`)는 앱 틀이다. 위에 제목·댓글·이력 줄을 두고, 문서는 격리된 iframe(`/raw`)으로 넣는다 (정책서 M4).
+/// 설문 문서가 응답을 내면 틀이 보는 사람에게 확인을 받은 뒤 로그인한 이름으로 낸다.
 pub async fn view(State(app): State<AppState>, jar: PrivateCookieJar, Path(id): Path<String>) -> Response {
-    let user = match current_user_next(&app, &jar, &format!("/d/{id}")) {
-        Ok(u) => u,
+    let (user, doc) = match user_and_doc(&app, &jar, &id) {
+        Ok(v) => v,
         Err(r) => return r,
     };
-    match app.docs.get(&id) {
-        Ok(Some(_)) => match app.docs.read(&id) {
-            Ok(bytes) => {
-                // 기록이 실패해도 문서는 보여 준다.
-                if let Err(e) = app.docs.record_view(&id) {
-                    eprintln!("열람 기록 실패: {e}");
-                }
-                // 설문 문서가 응답을 낼 수 있게 이 직원·이 문서에만 통하는 제출 함수를 넣는다.
-                document_response(bytes, &crate::survey::script(&app, &id, &user.email))
-            }
-            Err(e) => server_error("문서 파일 읽기", e),
-        },
-        Ok(None) => not_found(),
-        Err(e) => server_error("문서 조회", e),
+    // 기록이 실패해도 문서는 보여 준다.
+    if let Err(e) = app.docs.record_view(&id) {
+        eprintln!("열람 기록 실패: {e}");
+    }
+    let (_, comments) = app.docs.activity(std::slice::from_ref(&doc.id)).unwrap_or_default().get(&doc.id).copied().unwrap_or_default();
+    let responses = match app.docs.response_count(&id).unwrap_or(0) {
+        n if n > 0 && can_modify(&user, &doc) => format!("<a href=\"/d/{0}/responses\">응답<span class=\"n\">{n}</span></a>", escape(&id)),
+        _ => String::new(),
+    };
+    let (id, title) = (escape(&id), escape(&doc.title));
+    crate::auth::document_titled(
+        &doc.title,
+        &format!(
+            "<div class=\"viewer\"><header class=\"vbar\"><a class=\"brand\" href=\"/\">html-hub</a>\
+             <h1 class=\"vtitle\">{title}</h1><nav aria-label=\"문서 메뉴\">\
+             <a href=\"/d/{id}/comments\">댓글<span class=\"n\">{comments}</span></a><a href=\"/d/{id}/history\">이력</a>{responses}\
+             <a class=\"opt\" href=\"/d/{id}/raw\" target=\"_blank\" rel=\"noopener\">새 창</a></nav></header>\
+             <iframe id=\"doc\" src=\"/d/{id}/raw\" title=\"{title}\" \
+             sandbox=\"allow-scripts allow-popups allow-popups-to-escape-sandbox allow-modals allow-forms allow-downloads\" \
+             allow=\"fullscreen; clipboard-write\"></iframe></div>{}",
+            crate::survey::confirm_dialog(&user.name)
+        ),
+    )
+    .into_response()
+}
+
+/// 문서 원본. 앱 틀의 iframe 이 부르고, "새 창" 으로 따로 열 수도 있다. 격리 헤더는 그대로다.
+pub async fn view_raw(State(app): State<AppState>, jar: PrivateCookieJar, Path(id): Path<String>) -> Response {
+    if let Err(r) = user_and_doc(&app, &jar, &id) {
+        return r;
+    }
+    match app.docs.read(&id) {
+        Ok(bytes) => document_response(bytes, crate::survey::BRIDGE),
+        Err(e) => server_error("문서 파일 읽기", e),
     }
 }
 

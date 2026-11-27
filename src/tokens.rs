@@ -28,6 +28,9 @@ pub struct TokenInfo {
     pub last_used_at: Option<i64>,
 }
 
+/// 직원 토큰 기한 (1년). 새어 나간 토큰이 끝없이 쓰이지 않게 한다 (정책서 T5).
+const API_TTL: i64 = 365 * 24 * 3600;
+
 /// OAuth 토큰 기한 (90일). 지나면 Claude 쪽에서 다시 연결한다.
 const OAUTH_TTL: i64 = 90 * 24 * 3600;
 
@@ -100,8 +103,8 @@ impl Tokens {
         let h = hash(token);
         let email: Option<String> = conn
             .query_row(
-                "SELECT email FROM api_tokens WHERE hash = ?1 AND revoked_at IS NULL",
-                [&h],
+                "SELECT email FROM api_tokens WHERE hash = ?1 AND revoked_at IS NULL AND created_at > ?2",
+                params![h, now_unix() - API_TTL],
                 |r| r.get(0),
             )
             .optional()?;
@@ -161,8 +164,8 @@ impl Tokens {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT created_at, last_used_at FROM api_tokens WHERE email = ?1 AND revoked_at IS NULL",
-                [email],
+                "SELECT created_at, last_used_at FROM api_tokens WHERE email = ?1 AND revoked_at IS NULL AND created_at > ?2",
+                params![email, now_unix() - API_TTL],
                 |r| Ok(TokenInfo { created_at: r.get(0)?, last_used_at: r.get(1)? }),
             )
             .optional()?)
@@ -172,9 +175,9 @@ impl Tokens {
     pub fn active(&self) -> Result<Vec<(String, TokenInfo)>> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT email, created_at, last_used_at FROM api_tokens WHERE revoked_at IS NULL ORDER BY created_at DESC",
+            "SELECT email, created_at, last_used_at FROM api_tokens WHERE revoked_at IS NULL AND created_at > ?1 ORDER BY created_at DESC",
         )?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, TokenInfo { created_at: r.get(1)?, last_used_at: r.get(2)? })))?;
+        let rows = stmt.query_map([now_unix() - API_TTL], |r| Ok((r.get(0)?, TokenInfo { created_at: r.get(1)?, last_used_at: r.get(2)? })))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 }
@@ -248,7 +251,7 @@ pub async fn tokens_page(State(app): State<AppState>, jar: PrivateCookieJar) -> 
              <p class=\"lede\">도구가 문서를 올릴 때 쓰는 열쇠입니다. 이 토큰으로 올린 문서는 {} 님이 올린 것으로 기록되니 남에게 알려 주지 마세요.</p></div></div>\
              <div class=\"form\">{state}\
              <form method=\"post\" action=\"/tokens\"><button class=\"btn\">새 토큰 발급</button></form>\
-             <p class=\"lede\" style=\"margin-top:8px;font-size:13px\">새로 발급하면 이전 토큰은 바로 폐기됩니다.</p>{claude}</div>",
+             <p class=\"lede\" style=\"margin-top:8px;font-size:13px\">새로 발급하면 이전 토큰은 바로 폐기됩니다. 토큰은 발급하고 1년이 지나면 만료됩니다.</p>{claude}</div>",
             escape(&user.name)
         ),
     )
@@ -455,6 +458,15 @@ mod tests {
         t.revoke("a@x.im").unwrap();
         assert_eq!(t.owner(&second).unwrap(), None);
         assert!(t.info("a@x.im").unwrap().is_none());
+    }
+
+    #[test]
+    fn 직원_토큰은_1년이_지나면_못_쓴다() {
+        let t = Tokens::open(":memory:").unwrap();
+        let tok = t.issue("a@x.im").unwrap();
+        t.0.lock().unwrap().execute("UPDATE api_tokens SET created_at = created_at - ?1", [API_TTL + 1]).unwrap();
+        assert_eq!(t.owner(&tok).unwrap(), None);
+        assert!(t.info("a@x.im").unwrap().is_none() && t.active().unwrap().is_empty());
     }
 
     #[test]

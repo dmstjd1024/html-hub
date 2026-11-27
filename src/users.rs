@@ -72,6 +72,45 @@ impl Users {
         Ok(export.users.len())
     }
 
+    /// 내보내기 파일에 없는 활성 계정을 비활성화하고 그 이메일들을 돌려준다 (구글에서 지운 퇴사자는 파일에 안 나온다).
+    /// 파일 밖에서 손으로 넣은 계정도 꺼지므로 `import-users --deactivate-missing` 으로만 부른다.
+    pub fn deactivate_missing(&self, json: &str) -> Result<Vec<String>> {
+        let export: Export = serde_json::from_str(json)?;
+        let keep: Vec<String> = export.users.iter().map(|u| u.email.trim().to_lowercase()).collect();
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT email FROM users WHERE active = 1 ORDER BY email")?;
+        let gone: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|e| !keep.contains(e))
+            .collect();
+        for e in &gone {
+            conn.execute("UPDATE users SET active = 0 WHERE email = ?1", [e])?;
+        }
+        Ok(gone)
+    }
+
+    /// 한 사람의 역할을 바꾸거나(admin·member) 끈다(off). 없는 사람은 이름을 주면 새로 넣는다.
+    pub fn set(&self, email: &str, role: &str, name: Option<&str>) -> Result<()> {
+        let email = email.trim().to_lowercase();
+        let conn = self.0.lock().unwrap();
+        let changed = match role {
+            "off" => conn.execute("UPDATE users SET active = 0 WHERE email = ?1", [&email])?,
+            "admin" | "member" => match name {
+                Some(n) => conn.execute(
+                    "INSERT INTO users (email, name, role, active) VALUES (?1, ?2, ?3, 1)
+                     ON CONFLICT(email) DO UPDATE SET name = excluded.name, role = excluded.role, active = 1",
+                    params![email, n, role],
+                )?,
+                None => conn.execute("UPDATE users SET role = ?2, active = 1 WHERE email = ?1", params![email, role])?,
+            },
+            _ => anyhow::bail!("역할은 admin, member, off 중 하나다"),
+        };
+        anyhow::ensure!(changed == 1, "{email} 이 명단에 없다. 새로 넣으려면 이름을 함께 준다");
+        Ok(())
+    }
+
     /// 등록되어 있고 활성인 사람만 돌려준다.
     pub fn find_active(&self, email: &str) -> Result<Option<User>> {
         let conn = self.0.lock().unwrap();
@@ -120,6 +159,23 @@ mod tests {
         users.import(SAMPLE).unwrap();
         assert!(users.find_active("kim@example.com").unwrap().is_none());
         assert!(users.find_active("nobody@example.com").unwrap().is_none());
+    }
+
+    #[test]
+    fn 파일에_없는_계정을_끄고_역할을_바꾼다() {
+        let users = db();
+        users.import(SAMPLE).unwrap();
+        users.set("Me@Gmail.com", "admin", Some("나")).unwrap();
+        assert!(users.find_active("me@gmail.com").unwrap().unwrap().is_admin());
+        assert_eq!(users.deactivate_missing(SAMPLE).unwrap(), ["me@gmail.com"]);
+        assert!(users.find_active("me@gmail.com").unwrap().is_none());
+        assert!(users.find_active("hong@example.com").unwrap().is_some(), "파일에 있는 사람은 그대로");
+        users.set("me@gmail.com", "member", None).unwrap();
+        assert!(!users.find_active("me@gmail.com").unwrap().unwrap().is_admin());
+        users.set("hong@example.com", "off", None).unwrap();
+        assert!(users.find_active("hong@example.com").unwrap().is_none());
+        assert!(users.set("nobody@x.com", "member", None).is_err(), "없는 사람은 이름이 필요하다");
+        assert!(users.set("hong@example.com", "boss", None).is_err());
     }
 
     #[test]

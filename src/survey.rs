@@ -1,10 +1,11 @@
-//! 설문 응답 모으기. 올린 문서의 스크립트가 `window.htmlhub.submit({질문: 답})` 을 부르면 보고 있는 직원 이름으로 저장한다.
-//! 문서는 격리돼(출처 없음) 로그인 쿠키를 못 쓰므로, 문서를 내보낼 때 그 문서·그 직원에게만 통하는 제출 열쇠를 함께 넣는다.
-//! 문서 스크립트에는 누가 보고 있는지 알려 주지 않는다. 응답은 올린 사람과 관리자만 보고, 한 사람이 다시 내면 덮어쓴다.
+//! 설문 응답 모으기. 올린 문서의 스크립트가 `window.htmlhub.submit({질문: 답})` 을 부르면, 앱 틀이 보는 사람에게
+//! "○○ 이름으로 제출할까요?" 를 묻고 허락하면 로그인한 이름으로 저장한다.
+//! 문서는 격리된 iframe 이라 쿠키도 이름도 모른다. 틀에 메시지(postMessage)만 보내고, 실제 제출은 틀(이 사이트)이 한다.
+//! 그래서 문서가 보는 사람 몰래 이름을 모을 수 없다. 응답은 올린 사람과 관리자만 보고, 한 사람이 다시 내면 덮어쓴다.
 
 use crate::{
     AppState,
-    auth::{escape, page, shell},
+    auth::{current_user, escape, page, shell},
     docs::{SurveyResponse, can_modify, doc_header, server_error, user_and_doc},
 };
 use axum::{
@@ -14,68 +15,53 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use axum_extra::extract::cookie::PrivateCookieJar;
-use openidconnect::CsrfToken;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
-};
 
-/// 제출 열쇠 → (문서, 직원 이메일, 만료). 메모리에만 둔다. 서버를 다시 켜면 페이지를 새로고침해 새 열쇠를 받는다.
-pub type Keys = Arc<Mutex<HashMap<String, (String, String, u64)>>>;
-
-/// 로그인 세션과 같은 8시간.
-const KEY_TTL: u64 = 8 * 3600;
 pub const MAX_ANSWERS: usize = 64 * 1024;
 
-fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
-}
+/// 문서(`/raw`)에 넣는 `window.htmlhub.submit`. 틀에 묻고 답을 기다린다. 틀 없이 열면 제출할 수 없다고 알린다.
+pub const BRIDGE: &str = "window.htmlhub={submit:function(answers){return new Promise(function(ok,no){\
+if(window.parent===window){no(new Error('html-hub 문서 화면(/d/번호)에서 열어야 제출할 수 있습니다.'));return}\
+var id=Math.random().toString(36).slice(2);\
+function on(e){if(e.source!==window.parent||!e.data||e.data.htmlhub!==id)return;removeEventListener('message',on);\
+e.data.ok?ok(e.data.result):no(new Error(e.data.error))}\
+addEventListener('message',on);window.parent.postMessage({htmlhub:'submit',id:id,answers:answers},'*')})}};";
 
-/// 문서에 넣을 `window.htmlhub.submit`. 문서 번호와 열쇠는 영문·숫자·`-_` 뿐이라 그대로 넣어도 된다.
-pub fn script(app: &AppState, doc_id: &str, email: &str) -> String {
-    let key = format!("{}{}", CsrfToken::new_random().secret(), CsrfToken::new_random().secret());
-    let mut keys = app.survey_keys.lock().unwrap();
-    let t = now();
-    keys.retain(|_, k| k.2 > t);
-    keys.insert(key.clone(), (doc_id.to_owned(), email.to_owned(), t + KEY_TTL));
-    // text/plain 이면 브라우저가 사전 확인(preflight) 없이 보낸다. 응답은 서버가 CORS 로 읽게 해 준다.
+/// 앱 틀에 붙는 확인 창과, 문서의 제출 요청을 받아 확인 뒤 내는 스크립트.
+pub fn confirm_dialog(name: &str) -> String {
     format!(
-        "window.htmlhub={{submit:function(answers){{return fetch('/d/{doc_id}/responses',{{method:'POST',\
-         headers:{{'Content-Type':'text/plain'}},body:JSON.stringify({{key:'{key}',answers:answers}})}})\
-         .then(function(r){{return r.json().then(function(j){{if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}})}})}}}};"
+        "<dialog class=\"ask\" id=\"ask\" aria-labelledby=\"ask-h\"><h2 id=\"ask-h\">설문 응답을 제출할까요?</h2>\
+         <p>이 문서가 아래 응답을 <b>{}</b> 이름으로 제출하려고 합니다. 문서를 올린 사람과 관리자가 봅니다.</p><ul></ul>\
+         <form method=\"dialog\"><button class=\"btn line\" value=\"cancel\">취소</button><button class=\"btn\" value=\"send\">제출</button></form></dialog>\
+         <script>(function(){{var f=document.getElementById('doc'),d=document.getElementById('ask'),ul=d.querySelector('ul');\
+         function text(v){{return Array.isArray(v)?v.map(text).join(', '):(v!==null&&typeof v==='object')?JSON.stringify(v):String(v)}}\
+         addEventListener('message',async function(e){{\
+         if(e.source!==f.contentWindow||!e.data||e.data.htmlhub!=='submit')return;\
+         var reply=function(m){{m.htmlhub=e.data.id;f.contentWindow.postMessage(m,'*')}},a=e.data.answers;\
+         if(!a||typeof a!=='object'||Array.isArray(a))return reply({{ok:false,error:'응답은 {{질문: 답}} 꼴의 객체여야 합니다.'}});\
+         if(d.open)return reply({{ok:false,error:'다른 제출을 확인하는 중입니다.'}});\
+         ul.replaceChildren.apply(ul,Object.keys(a).slice(0,30).map(function(k){{var li=document.createElement('li');li.textContent=k+': '+text(a[k]);return li}}));\
+         d.returnValue='';d.showModal();\
+         var send=await new Promise(function(r){{d.addEventListener('close',function(){{r(d.returnValue==='send')}},{{once:true}})}});\
+         if(!send)return reply({{ok:false,error:'제출을 취소했습니다.'}});\
+         try{{var r=await fetch(location.pathname+'/responses',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{answers:a}})}});\
+         var j=await r.json().catch(function(){{return {{}}}});reply(r.ok?{{ok:true,result:j}}:{{ok:false,error:j.error||('HTTP '+r.status)}})}}\
+         catch(err){{reply({{ok:false,error:String(err)}})}}}})}})()</script>",
+        escape(name)
     )
 }
 
 #[derive(Deserialize)]
-struct Submission {
-    key: String,
+pub struct Submission {
     answers: Value,
 }
 
-/// 문서에서 보낸 응답을 받는다. 쿠키 대신 제출 열쇠로 누구인지 안다 (그래서 main 의 출처 검사에서 뺀다).
-pub async fn submit(State(app): State<AppState>, Path(id): Path<String>, body: String) -> Response {
-    // 격리된 문서(출처 null)가 결과를 읽을 수 있게 한다. 쿠키를 쓰지 않으므로 * 로 충분하다.
-    let reply = |status: StatusCode, v: Value| (status, [(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")], Json(v)).into_response();
-    let fail = |status: StatusCode, msg: &str| reply(status, json!({ "error": msg }));
-    let Ok(s) = serde_json::from_str::<Submission>(&body) else {
-        return fail(StatusCode::BAD_REQUEST, "형식이 잘못됐습니다.");
-    };
-    let email = {
-        let mut keys = app.survey_keys.lock().unwrap();
-        let t = now();
-        keys.retain(|_, k| k.2 > t);
-        keys.get(&s.key).filter(|k| k.0 == id).map(|k| k.1.clone())
-    };
-    let Some(email) = email else {
-        return fail(StatusCode::UNAUTHORIZED, "제출 기한이 지났습니다. 페이지를 새로고침한 뒤 다시 제출해 주세요.");
-    };
-    let user = match app.users.find_active(&email) {
-        Ok(Some(u)) => u,
-        Ok(None) => return fail(StatusCode::FORBIDDEN, "등록되지 않았거나 비활성화된 계정입니다."),
-        Err(e) => return server_error("명단 조회", e),
+/// 앱 틀이 확인을 받은 뒤 보내는 응답. 로그인 쿠키로 누구인지 알고, 이 사이트 화면에서 온 요청만 받는다 (main 의 출처 검사).
+pub async fn submit(State(app): State<AppState>, jar: PrivateCookieJar, Path(id): Path<String>, Json(s): Json<Submission>) -> Response {
+    let fail = |status: StatusCode, msg: &str| (status, Json(json!({ "error": msg }))).into_response();
+    let Ok(user) = current_user(&app, &jar) else {
+        return fail(StatusCode::UNAUTHORIZED, "로그인이 풀렸습니다. 새로고침한 뒤 다시 제출해 주세요.");
     };
     if !s.answers.is_object() {
         return fail(StatusCode::BAD_REQUEST, "응답은 {질문: 답} 꼴의 객체여야 합니다.");
@@ -90,7 +76,7 @@ pub async fn submit(State(app): State<AppState>, Path(id): Path<String>, body: S
         Err(e) => return server_error("문서 조회", e),
     }
     match app.docs.save_response(&id, &user, &answers) {
-        Ok(()) => reply(StatusCode::OK, json!({ "ok": true })),
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
         Err(e) => server_error("응답 저장", e),
     }
 }
@@ -148,7 +134,7 @@ pub async fn responses_page(State(app): State<AppState>, jar: PrivateCookieJar, 
     };
     let body = if list.is_empty() {
         "<p class=\"empty\">아직 응답이 없습니다. 문서의 스크립트에서 <code>window.htmlhub.submit({질문: 답})</code> 을 부르면 \
-         보고 있는 직원 이름으로 여기에 모입니다.</p>"
+         보는 사람이 확인한 뒤 그 사람 이름으로 여기에 모입니다.</p>"
             .to_owned()
     } else {
         let (cols, rows) = table(&list);
@@ -166,7 +152,7 @@ pub async fn responses_page(State(app): State<AppState>, jar: PrivateCookieJar, 
             })
             .collect();
         format!(
-            "<p class=\"result\">응답 {}명<span class=\"sep\" aria-hidden=\"true\">·</span><a href=\"/d/{}/responses.csv\">CSV 내려받기</a></p>\
+            "<p class=\"result\">응답 {}명<span class=\"sep\" aria-hidden=\"true\">·</span><a href=\"/d/{}/responses/csv\">CSV 내려받기</a></p>\
              <div class=\"table-wrap\"><table><thead><tr><th scope=\"col\">응답한 사람</th>{head}</tr></thead><tbody>{body}</tbody></table></div>",
             list.len(),
             escape(&doc.id)

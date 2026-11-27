@@ -272,6 +272,21 @@ td.t{width:40%;max-width:0}
 .actions .link.danger{color:var(--alert)}
 .actions form{display:inline}
 pre{background:var(--tag);border-radius:6px;padding:12px 14px;overflow-x:auto;font-size:13px}
+.viewer{display:flex;flex-direction:column;height:100vh;height:100dvh}
+.vbar{display:flex;align-items:center;gap:12px;height:44px;padding:0 8px 0 16px;background:var(--forest);flex:none;min-width:0}
+.vbar .brand{font-size:15px;flex:none}
+.vtitle{flex:1;min-width:0;margin:0;font-size:14.5px;font-weight:500;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.vbar nav{display:flex;flex:none}
+.vbar nav a{display:flex;align-items:center;min-height:44px;padding:0 8px;color:#C9D8CE;font-size:13.5px;text-decoration:none;white-space:nowrap}
+.vbar nav a:hover{color:#fff}
+.vbar .n{color:#8FA698;margin-left:3px}
+.viewer iframe{flex:1;width:100%;border:0;background:#fff}
+dialog.ask{border:1px solid var(--line);border-radius:12px;padding:20px 22px;width:min(440px,92vw);background:var(--surface);color:var(--ink)}
+dialog.ask::backdrop{background:rgba(0,0,0,.4)}
+dialog.ask h2{font-size:17px}
+dialog.ask ul{margin:8px 0 16px;padding-left:18px;max-height:40vh;overflow:auto;font-size:14px;color:var(--ink-2)}
+dialog.ask form{display:flex;gap:8px;justify-content:flex-end}
+@media (max-width:560px){.vbar .brand,.vbar nav a.opt{display:none}}
 @media (max-width:1200px){.grid{grid-template-columns:minmax(0,1fr)}.side{display:grid;grid-template-columns:1fr 1fr;gap:24px}}
 @media (max-width:860px){
 .app{display:block}
@@ -337,10 +352,15 @@ pre{background:var(--tag);border-radius:6px;padding:12px 14px;overflow-x:auto;fo
 "#;
 
 fn document(body: &str) -> Html<String> {
+    document_titled("html-hub", body)
+}
+
+pub(crate) fn document_titled(title: &str, body: &str) -> Html<String> {
+    let title = escape(title);
     Html(format!(
         "<!doctype html><html lang=\"ko\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-         <title>html-hub</title>\
+         <title>{title}</title>\
          <link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">\
          <link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>\
          <link rel=\"stylesheet\" href=\"https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+KR:wght@400;500;600&display=swap\">\

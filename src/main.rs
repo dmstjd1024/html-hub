@@ -28,7 +28,6 @@ pub struct AppState {
     pub key: Key,
     pub secure_cookies: bool,
     pub grants: mcp::Grants,
-    pub survey_keys: survey::Keys,
 }
 
 impl FromRef<AppState> for Key {
@@ -39,18 +38,23 @@ impl FromRef<AppState> for Key {
 
 /// 상태를 바꾸는 요청(POST 등)은 이 사이트의 화면에서 보낸 것만 받는다 (위조 요청 방지).
 /// 격리된 문서 속 폼은 Origin: null 을 보내고, 다른 사이트는 자기 출처를 보낸다. 쿠키가 실려 와도 거절한다.
-/// 토큰으로 받는 /api/upload·/mcp 와 OAuth 토큰 교환·등록, 설문 제출(문서에 넣은 제출 열쇠로 확인)은 쿠키를 쓰지 않으므로 검사하지 않는다.
+/// 토큰으로 받는 /api/upload·/mcp 와 OAuth 토큰 교환·등록은 쿠키를 쓰지 않으므로 검사하지 않는다.
 async fn same_origin_only(State(origin): State<String>, req: Request, next: Next) -> Response {
     let reads = matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
     let from_here = req.headers().get(header::ORIGIN).is_some_and(|o| o.as_bytes() == origin.as_bytes());
-    let path = req.uri().path();
-    let tokens_only = matches!(path, "/api/upload" | "/mcp" | "/oauth/token" | "/oauth/register")
-        || (path.starts_with("/d/") && path.ends_with("/responses"));
+    let tokens_only = matches!(req.uri().path(), "/api/upload" | "/mcp" | "/oauth/token" | "/oauth/register");
     if reads || from_here || tokens_only {
         return next.run(req).await;
     }
     eprintln!("다른 출처의 요청 거절: {} {} (Origin {:?})", req.method(), req.uri().path(), req.headers().get(header::ORIGIN));
     (StatusCode::FORBIDDEN, auth::page("다른 화면에서 보낸 요청이라 처리하지 않았습니다. <a href=\"/\">목록으로</a>")).into_response()
+}
+
+/// 로그인한 화면·CSV 가 Cloudflare 나 브라우저 공유 캐시에 남지 않게, 캐시 규칙을 따로 정하지 않은 응답은 저장하지 말라고 한다.
+/// (Cloudflare 는 `.csv` 같은 확장자를 기본으로 캐시해, 응답 CSV 가 로그인 없이 새어 나갈 수 있었다.)
+async fn no_store(mut res: Response) -> Response {
+    res.headers_mut().entry(header::CACHE_CONTROL).or_insert(header::HeaderValue::from_static("private, no-store"));
+    res
 }
 
 /// BASE_URL 에서 출처(scheme://host[:port])만 뗀다. Origin 헤더와 같은 꼴이다.
@@ -73,12 +77,26 @@ async fn main() -> Result<()> {
     }
     let users = users::Users::open(&db_path)?;
 
-    let mut args = std::env::args().skip(1);
-    if args.next().as_deref() == Some("import-users") {
-        let path = args.next().context("사용법: html-hub import-users <내보내기.json>")?;
-        let count = users.import(&std::fs::read_to_string(path)?)?;
-        println!("{count}명 반영");
-        return Ok(());
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+        ["import-users", rest @ ..] => {
+            let deactivate = rest.contains(&"--deactivate-missing");
+            let path = rest.iter().find(|a| !a.starts_with("--")).context("사용법: html-hub import-users [--deactivate-missing] <내보내기.json>")?;
+            let json = std::fs::read_to_string(path)?;
+            println!("{}명 반영", users.import(&json)?);
+            if deactivate {
+                let gone = users.deactivate_missing(&json)?;
+                println!("파일에 없어 끈 계정 {}개{}", gone.len(), if gone.is_empty() { String::new() } else { format!(": {}", gone.join(", ")) });
+            }
+            return Ok(());
+        }
+        ["user", email, role, name @ ..] => {
+            users.set(email, role, name.first().copied())?;
+            println!("{email}: {role}");
+            return Ok(());
+        }
+        [] => {}
+        _ => bail!("사용법: html-hub [import-users [--deactivate-missing] <파일> | user <이메일> <admin|member|off> [이름]]"),
     }
 
     let base_url = std::env::var("BASE_URL").unwrap_or_else(|_| "http://localhost:3000".into());
@@ -129,13 +147,15 @@ async fn main() -> Result<()> {
         )
         .route("/uploaded/{id}", get(docs::uploaded))
         .route("/d/{id}", get(docs::view))
+        .route("/d/{id}/raw", get(docs::view_raw))
         .route("/d/{id}/delete", post(docs::delete))
         .route("/d/{id}/unhide", post(docs::unhide))
         .route("/admin/hidden", get(docs::hidden_list))
         .route("/d/{id}/history", get(docs::history))
         .route("/d/{id}/comments", get(docs::comments_view).post(docs::comment_add))
         .route("/d/{id}/responses", get(survey::responses_page).post(survey::submit))
-        .route("/d/{id}/responses.csv", get(survey::responses_csv))
+        // 주소에 .csv 를 붙이면 Cloudflare 가 정적 파일로 보고 브라우저 캐시 기한(4시간)을 덮어쓴다. 확장자 없이 둔다.
+        .route("/d/{id}/responses/csv", get(survey::responses_csv))
         .route("/d/{id}/comments/{cid}/delete", post(docs::comment_delete))
         .route("/d/{id}/v/{n}", get(docs::view_version))
         .route("/d/{id}/restore/{n}", post(docs::restore))
@@ -153,9 +173,9 @@ async fn main() -> Result<()> {
             key: Key::from(session_key.as_bytes()),
             secure_cookies: base_url.starts_with("https://"),
             grants: Default::default(),
-            survey_keys: Default::default(),
         })
-        .layer(middleware::from_fn_with_state(origin_of(&base_url), same_origin_only));
+        .layer(middleware::from_fn_with_state(origin_of(&base_url), same_origin_only))
+        .layer(middleware::map_response(no_store));
 
     let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into());
     println!("{addr} 에서 대기 중 ({base_url})");

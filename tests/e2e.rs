@@ -340,7 +340,7 @@ async fn r1_1_올리기_화면과_입력_검사() {
     let r = s.multipart("/upload", Some(&me), None, &[("title", "md")], Some(("note.md", md))).await;
     assert_eq!(r.status, StatusCode::SEE_OTHER);
     let id = r.location().rsplit('/').next().unwrap().to_owned();
-    let body = original(&s.get(&format!("/d/{id}"), Some(&me)).await.body);
+    let body = original(&s.get(&format!("/d/{id}/raw"), Some(&me)).await.body);
     assert!(body.starts_with("<!doctype html>") && body.contains("<h1>회의록</h1>"), "{body}");
     assert_eq!(listed_titles(&s.get("/?q=금요일", Some(&me)).await.body), ["md"]);
     for name in ["a.svg", "a.mmd", "a.jsx"] {
@@ -390,9 +390,18 @@ async fn r1_2_링크로_열기() {
     // 명단에 없는 계정은 보지 못한다.
     assert_eq!(s.get(&format!("/d/{id}"), Some(&s.login(STRANGER))).await.location(), "/login");
 
+    // 문서 링크는 앱 틀이고, 문서는 격리된 iframe(/raw)으로 들어간다.
+    let frame = s.get(&format!("/d/{id}"), Some(&me)).await;
+    assert_eq!(frame.status, StatusCode::OK);
+    assert!(frame.body.contains(&format!("<iframe id=\"doc\" src=\"/d/{id}/raw\"")) && frame.body.contains("<title>열기</title>"), "{}", frame.body);
+    let sandbox = frame.body.split("sandbox=\"").nth(1).unwrap().split('"').next().unwrap();
+    assert!(sandbox.contains("allow-scripts") && !sandbox.contains("allow-same-origin") && !sandbox.contains("allow-top-navigation"), "{sandbox}");
+    assert_eq!(frame.headers[header::CACHE_CONTROL], "private, no-store", "로그인 화면은 캐시하지 않는다");
+    assert_eq!(s.get(&format!("/d/{id}/raw"), None).await.location(), format!("/login?next=/d/{id}"));
+
     // 다른 직원도 볼 수 있다 (프로젝트는 열람 범위를 나누지 않는다).
     for who in [OWNER, OTHER] {
-        let r = s.get(&format!("/d/{id}"), Some(&s.login(who))).await;
+        let r = s.get(&format!("/d/{id}/raw"), Some(&s.login(who))).await;
         assert_eq!(r.status, StatusCode::OK);
         assert_eq!(original(&r.body), html, "올린 내용 그대로 (대체 코드는 doctype 뒤에만)");
         assert!(r.body.starts_with("<!doctype html><script>"), "doctype 이 맨 앞");
@@ -409,9 +418,9 @@ async fn r1_2_링크로_열기() {
     assert_eq!(r.status, StatusCode::NOT_FOUND);
     assert!(r.body.contains("없는 문서"));
 
-    // 열람은 문서 번호와 시각만 남는다 (북극성 지표).
+    // 열람은 문서 번호와 시각만 남는다 (북극성 지표). 앱 틀을 연 번만 세고, 틀 안의 원본(/raw)은 세지 않는다.
     let views: i64 = s.db().query_row("SELECT COUNT(*) FROM views WHERE doc_id = ?1", [&id], |r| r.get(0)).unwrap();
-    assert_eq!(views, 2);
+    assert_eq!(views, 1);
 }
 
 // ---------- R1-3·4 목록, 검색, 프로젝트, 쪽 나누기 ----------
@@ -556,7 +565,7 @@ async fn r2_새_버전_교체_이력_되돌리기() {
     let r = replace(&owner, "v.html", "<p>v2 새내용</p>").await;
     assert_eq!(r.location(), format!("/d/{id}/history"));
 
-    assert_eq!(original(&s.get(&format!("/d/{id}"), Some(&other)).await.body), "<p>v2 새내용</p>", "링크는 그대로, 내용은 새 버전");
+    assert_eq!(original(&s.get(&format!("/d/{id}/raw"), Some(&other)).await.body), "<p>v2 새내용</p>", "링크는 그대로, 내용은 새 버전");
     assert_eq!(original(&s.get(&format!("/d/{id}/v/1"), Some(&other)).await.body), "<p>v1 첫내용</p>");
     assert_eq!(s.get(&format!("/d/{id}/v/9"), Some(&other)).await.status, StatusCode::NOT_FOUND);
     let hist = s.get(&format!("/d/{id}/history"), Some(&other)).await.body;
@@ -569,7 +578,7 @@ async fn r2_새_버전_교체_이력_되돌리기() {
     // 되돌리기: 올린 사람만, 옛 내용이 새 버전(3)으로 쌓인다.
     assert_eq!(s.post(&format!("/d/{id}/restore/1"), Some(&other), &[]).await.status, StatusCode::FORBIDDEN);
     assert_eq!(s.post(&format!("/d/{id}/restore/1"), Some(&owner), &[]).await.status, StatusCode::SEE_OTHER);
-    assert_eq!(original(&s.get(&format!("/d/{id}"), Some(&owner)).await.body), "<p>v1 첫내용</p>");
+    assert_eq!(original(&s.get(&format!("/d/{id}/raw"), Some(&owner)).await.body), "<p>v1 첫내용</p>");
     assert!(s.get(&format!("/d/{id}/history"), Some(&owner)).await.body.contains(&format!("/d/{id}/v/3")));
     assert_eq!(s.post(&format!("/d/{id}/restore/9"), Some(&owner), &[]).await.status, StatusCode::NOT_FOUND);
 }
@@ -932,7 +941,7 @@ async fn 원격_mcp_는_oauth_로_연결해_올린다() {
     let id = url.strip_prefix(&format!("{}/d/", s.base)).expect("문서 링크를 돌려준다");
     let who: String = s.db().query_row("SELECT uploader_email FROM documents WHERE id = ?1", [id], |r| r.get(0)).unwrap();
     assert_eq!(who, OWNER, "승인한 사람 이름으로 올라간다");
-    assert!(original(&s.get(&format!("/d/{id}"), Some(&me)).await.body).contains("<h1>회고</h1>"));
+    assert!(original(&s.get(&format!("/d/{id}/raw"), Some(&me)).await.body).contains("<h1>회고</h1>"));
     let bad = json(&send_json(&s, "/mcp", Some(&token), call(serde_json::json!({ "title": "x", "content": "x", "format": "pdf" }))).await);
     assert_eq!(bad["result"]["isError"], true);
 
@@ -952,58 +961,50 @@ async fn 원격_mcp_는_oauth_로_연결해_올린다() {
 
 // ---------- 설문 ----------
 
-/// 격리된 문서가 보내듯 Origin: null, text/plain 으로 응답을 낸다. 쿠키는 없다.
-async fn submit_answers(s: &Server, doc: &str, body: serde_json::Value) -> Res {
+/// 앱 틀이 확인을 받은 뒤 보내듯, 같은 사이트 Origin 과 로그인 쿠키로 JSON 을 낸다.
+async fn submit_answers(s: &Server, doc: &str, cookie: Option<&str>, origin: &str, answers: serde_json::Value) -> Res {
     let req = s
         .http
         .post(format!("{}/d/{doc}/responses", s.base))
-        .header(header::ORIGIN, "null")
-        .header(header::CONTENT_TYPE, "text/plain")
-        .body(body.to_string());
-    s.send(req, None).await
-}
-
-fn submit_key(body: &str) -> String {
-    body.split("key:'").nth(1).expect("문서에 제출 함수가 들어 있어야 한다").split('\'').next().unwrap().to_owned()
+        .header(header::ORIGIN, origin)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(serde_json::json!({ "answers": answers }).to_string());
+    s.send(req, cookie).await
 }
 
 #[tokio::test]
-async fn 설문_응답은_보는_직원_이름으로_모이고_올린_사람만_본다() {
+async fn 설문_응답은_확인을_거쳐_직원_이름으로_모이고_올린_사람만_본다() {
     use serde_json::json;
     let s = Server::start().await;
     let (owner, other, admin) = (s.login(OWNER), s.login(OTHER), s.login(ADMIN));
     let html = "<!doctype html><form>만족도 조사</form>";
     let id = s.upload(&owner, "만족도 조사", "운영", html).await;
     let id2 = s.upload(&owner, "다른 문서", "", "<p>x</p>").await;
+    let base = s.base.clone();
 
-    // 문서를 열면 제출 함수가 같은 script 에 들어가고, 원본은 그대로다.
-    let r = s.get(&format!("/d/{id}"), Some(&other)).await;
-    assert!(r.body.contains("window.htmlhub="));
-    assert_eq!(original(&r.body), html);
-    let key = submit_key(&r.body);
+    // 문서에는 틀에 묻는 제출 함수만 들어가고(이름·열쇠 없음), 원본은 그대로다. 틀에는 확인 창이 있다.
+    let raw = s.get(&format!("/d/{id}/raw"), Some(&other)).await.body;
+    assert!(raw.contains("window.htmlhub=") && raw.contains("postMessage") && !raw.contains(OTHER));
+    assert_eq!(original(&raw), html);
+    let frame = s.get(&format!("/d/{id}"), Some(&other)).await.body;
+    assert!(frame.contains("설문 응답을 제출할까요?"));
 
-    // 낸다. 결과를 문서가 읽을 수 있게 CORS 를 연다.
-    let r = submit_answers(&s, &id, json!({ "key": key, "answers": { "만족도": 5, "의견": "=좋아요", "고른 것": ["A", "B"] } })).await;
+    // 격리된 문서(Origin null)나 로그인 없이 낸 것은 받지 않는다.
+    assert_eq!(submit_answers(&s, &id, Some(&other), "null", json!({ "a": 1 })).await.status, StatusCode::FORBIDDEN);
+    assert_eq!(submit_answers(&s, &id, None, &base, json!({ "a": 1 })).await.status, StatusCode::UNAUTHORIZED);
+
+    // 낸다. 다시 내면 덮어쓴다.
+    let r = submit_answers(&s, &id, Some(&other), &base, json!({ "만족도": 5, "의견": "=좋아요", "고른 것": ["A", "B"] })).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
-    assert_eq!(r.headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
-    // 다시 내면 덮어쓴다.
-    let r = submit_answers(&s, &id, json!({ "key": key, "answers": { "만족도": 4, "의견": "=좋아요", "고른 것": ["A", "B"] } })).await;
+    let r = submit_answers(&s, &id, Some(&other), &base, json!({ "만족도": 4, "의견": "=좋아요", "고른 것": ["A", "B"] })).await;
     assert_eq!(r.status, StatusCode::OK);
-
-    // 열쇠가 틀리거나 다른 문서의 것이면 받지 않는다. 답은 객체여야 한다.
-    let wrong = submit_answers(&s, &id, json!({ "key": "nope", "answers": {} })).await;
-    assert_eq!(wrong.status, StatusCode::UNAUTHORIZED);
-    assert!(wrong.body.contains("새로고침"));
-    assert_eq!(submit_answers(&s, &id2, json!({ "key": key, "answers": {} })).await.status, StatusCode::UNAUTHORIZED);
-    assert_eq!(submit_answers(&s, &id, json!({ "key": key, "answers": [1] })).await.status, StatusCode::BAD_REQUEST);
-    assert_eq!(submit_answers(&s, &id, json!({ "key": key, "answers": { "x": "a".repeat(70_000) } })).await.status, StatusCode::PAYLOAD_TOO_LARGE);
-
-    let admin_key = submit_key(&s.get(&format!("/d/{id}"), Some(&admin)).await.body);
-    assert_eq!(submit_answers(&s, &id, json!({ "key": admin_key, "answers": { "만족도": 3, "추가 질문": "네" } })).await.status, StatusCode::OK);
+    assert_eq!(submit_answers(&s, &id, Some(&other), &base, json!([1])).await.status, StatusCode::BAD_REQUEST);
+    assert_eq!(submit_answers(&s, &id, Some(&other), &base, json!({ "x": "a".repeat(70_000) })).await.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(submit_answers(&s, &id, Some(&admin), &base, json!({ "만족도": 3, "추가 질문": "네" })).await.status, StatusCode::OK);
 
     // 결과는 올린 사람과 관리자만 본다.
     assert_eq!(s.get(&format!("/d/{id}/responses"), Some(&other)).await.status, StatusCode::FORBIDDEN);
-    assert_eq!(s.get(&format!("/d/{id}/responses.csv"), Some(&other)).await.status, StatusCode::FORBIDDEN);
+    assert_eq!(s.get(&format!("/d/{id}/responses/csv"), Some(&other)).await.status, StatusCode::FORBIDDEN);
     assert_eq!(s.get(&format!("/d/{id}/responses"), Some(&admin)).await.status, StatusCode::OK);
     let page = s.get(&format!("/d/{id}/responses"), Some(&owner)).await.body;
     let other_name: String = s.db().query_row("SELECT name FROM users WHERE email = ?1", [OTHER], |r| r.get(0)).unwrap();
@@ -1012,12 +1013,15 @@ async fn 설문_응답은_보는_직원_이름으로_모이고_올린_사람만_
     assert!(cols.windows(2).all(|w| w[0] < w[1]), "질문은 처음 나온 순서대로");
     assert!(page.contains("<td>4</td>") && !page.contains("<td>5</td>"), "다시 낸 답으로 덮어쓴다");
 
-    // 응답이 있는 문서에만 응답 탭이 생긴다.
+    // 응답이 있는 문서에만 응답 탭이 생기고, 틀의 위 줄에는 올린 사람에게만 보인다.
     assert!(s.get(&format!("/d/{id}/history"), Some(&owner)).await.body.contains(&format!("/d/{id}/responses")));
     assert!(!s.get(&format!("/d/{id2}/history"), Some(&owner)).await.body.contains("/responses"));
+    assert!(s.get(&format!("/d/{id}"), Some(&owner)).await.body.contains(&format!("/d/{id}/responses")));
+    assert!(!s.get(&format!("/d/{id}"), Some(&other)).await.body.contains(&format!("/d/{id}/responses")));
 
-    // CSV: 엑셀용 BOM, 질문 순서, 수식 무력화.
-    let csv = s.get(&format!("/d/{id}/responses.csv"), Some(&owner)).await.body;
-    assert!(csv.starts_with("\u{feff}\"이름\",\"이메일\",\"제출 시각\",\"만족도\",\"의견\",\"고른 것\",\"추가 질문\"\r\n"), "{csv}");
-    assert!(csv.contains("\"'=좋아요\"") && csv.contains(OTHER), "{csv}");
+    // CSV: 캐시 금지, 엑셀용 BOM, 질문 순서, 수식 무력화.
+    let r = s.get(&format!("/d/{id}/responses/csv"), Some(&owner)).await;
+    assert_eq!(r.headers[header::CACHE_CONTROL], "private, no-store", "Cloudflare 가 CSV 를 캐시하지 않게");
+    assert!(r.body.starts_with("\u{feff}\"이름\",\"이메일\",\"제출 시각\",\"만족도\",\"의견\",\"고른 것\",\"추가 질문\"\r\n"), "{}", r.body);
+    assert!(r.body.contains("\"'=좋아요\"") && r.body.contains(OTHER), "{}", r.body);
 }
