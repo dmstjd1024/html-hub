@@ -369,13 +369,14 @@ fn upload(app: &AppState, user: &User, a: &Value) -> Result<String, String> {
     }
     crate::docs::check_meta(title, project)?;
     let bytes = to_bytes(title, a)?;
-    if !crate::docs::within_quota(app, &user.email) {
-        return Err(crate::docs::OVER_QUOTA.into());
-    }
-    let id = app.docs.insert(title, project, user, &bytes).map_err(|e| {
-        log!("문서 저장 실패: {e}");
-        "서버 오류로 올리지 못했습니다.".to_owned()
-    })?;
+    let id = app
+        .docs
+        .with_quota(&user.email, || app.docs.insert(title, project, user, &bytes))
+        .map_err(|e| {
+            log!("문서 저장 실패: {e}");
+            "서버 오류로 올리지 못했습니다.".to_owned()
+        })?
+        .ok_or(crate::docs::OVER_QUOTA)?;
     Ok(format!("{}/d/{id}", base(app)))
 }
 
@@ -404,13 +405,14 @@ fn update(app: &AppState, user: &User, a: &Value) -> Result<String, String> {
     let mut done = Vec::new();
     if has_content {
         let bytes = to_bytes(&title, a)?;
-        if !crate::docs::within_quota(app, &user.email) {
-            return Err(crate::docs::OVER_QUOTA.into());
-        }
-        let n = app.docs.replace(id, user, &bytes).map_err(|e| {
-            log!("새 버전 저장 실패: {e}");
-            "서버 오류로 바꾸지 못했습니다.".to_owned()
-        })?;
+        let n = app
+            .docs
+            .with_quota(&user.email, || app.docs.replace(id, user, &bytes))
+            .map_err(|e| {
+                log!("새 버전 저장 실패: {e}");
+                "서버 오류로 바꾸지 못했습니다.".to_owned()
+            })?
+            .ok_or(crate::docs::OVER_QUOTA)?;
         done.push(format!("{n}번째 버전"));
     }
     if title != doc.title || project != doc.project {

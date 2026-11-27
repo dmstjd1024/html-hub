@@ -1156,3 +1156,37 @@ async fn 관리자_폐기와_계정_끄기는_claude_연결도_막고_되돌리�
     assert_eq!(n, 2);
     assert_eq!(original(&s.get(&format!("/d/{id}/raw"), Some(&owner)).await.body), "<p>v2</p>");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn 동시에_올려도_하루_한도를_넘지_않는다() {
+    let s = Server::start().await;
+    let owner = s.login(OWNER);
+    let id = s.upload(&owner, "한도", "", "<p>x</p>").await;
+    let token = issue_token(&s, &owner).await;
+    // 이미 올린 1건에 198건을 더해 한 자리만 남긴다.
+    let db = s.db();
+    for n in 100..298 {
+        db.execute("INSERT INTO versions (doc_id, n, file, by_email, by_name, created_at) VALUES (?1, ?2, 'x', ?3, 'x', strftime('%s','now'))", rusqlite::params![id, n, OWNER]).unwrap();
+    }
+    // 파일이 클수록 저장이 오래 걸려, 세는 것과 저장이 따로면 여러 건이 함께 통과한다.
+    let file = format!("<p>{}</p>", "x".repeat(4 * 1024 * 1024));
+    let body = format!("--b\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\n동시\r\n--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.html\"\r\n\r\n{file}\r\n--b--\r\n");
+    let tasks: Vec<_> = (0..8)
+        .map(|_| {
+            let req = s
+                .http
+                .post(format!("{}/api/upload", s.base))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "multipart/form-data; boundary=b")
+                .body(body.clone());
+            tokio::spawn(async move { req.send().await.unwrap().status() })
+        })
+        .collect();
+    let mut created = 0;
+    for t in tasks {
+        if t.await.unwrap() == StatusCode::CREATED {
+            created += 1;
+        }
+    }
+    assert_eq!(created, 1, "남은 한 자리만 통과해야 한다");
+}

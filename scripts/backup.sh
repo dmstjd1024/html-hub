@@ -48,4 +48,13 @@ if [ -n "${BACKUP_REMOTE:-}" ]; then
   # 로컬 백업 폴더가 기준이다. 완전 삭제와 오래된 DB 스냅샷 정리를 원격에도 따라가게 한다.
   rsync -a --delete "$BACKUP_DIR/" "$BACKUP_REMOTE"
 fi
+# 로그 순환: 5MB 를 넘으면 .1 로 복사하고 비운다 (직전 한 벌만 남는다).
+# launchd 가 파일을 덧붙이기로 쥐고 있어 이름을 바꾸면 안 되고, 비우면 처음부터 이어 쓴다.
+for f in "$HOME"/Library/Logs/html-hub/*.log "$HOME"/Library/Logs/cloudflared/*.log; do
+  if [ -f "$f" ] && [ "$(wc -c < "$f")" -gt 5242880 ]; then
+    cp -p "$f" "$f.1"
+    : > "$f"
+  fi
+done
+
 echo "백업 완료: $(date '+%F %T')"

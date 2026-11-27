@@ -117,6 +117,8 @@ pub struct Doc {
 pub struct Docs {
     db: Arc<Mutex<Connection>>,
     dir: PathBuf,
+    /// 한도를 세는 것과 저장을 한 번에 한 요청씩 한다. 읽기는 막지 않는다.
+    uploads: Arc<Mutex<()>>,
 }
 
 impl Docs {
@@ -182,6 +184,7 @@ impl Docs {
         let docs = Self {
             db: Arc::new(Mutex::new(conn)),
             dir: dir.into(),
+            uploads: Default::default(),
         };
         docs.index_missing()?;
         Ok(docs)
@@ -349,6 +352,17 @@ impl Docs {
             params![email, now_unix() - 24 * 3600],
             |r| r.get(0),
         )?)
+    }
+
+    /// 오늘 한도가 남았을 때만 `save` 를 실행한다. 넘었으면 None.
+    /// 셀 수 없으면 막지 않는다 (올리기를 멈추는 것보다 낫다).
+    pub fn with_quota<T>(&self, email: &str, save: impl FnOnce() -> Result<T>) -> Result<Option<T>> {
+        // 저장 중에 패닉이 나도 다음 올리기는 되게 한다 (지키는 값이 없는 잠금이다).
+        let _one = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
+        if self.uploads_today(email).is_ok_and(|n| n >= DAILY_UPLOADS) {
+            return Ok(None);
+        }
+        save().map(Some)
     }
 
     /// 상태 확인: DB 를 읽을 수 있고 문서 폴더가 있는가.
@@ -1213,11 +1227,6 @@ pub async fn read_form(mut form: Multipart) -> Result<Form, &'static str> {
 pub const DAILY_UPLOADS: i64 = 200;
 pub const OVER_QUOTA: &str = "하루 올리기 한도(200건)를 넘었습니다. 내일 다시 하거나 관리자에게 문의하세요.";
 
-/// 오늘 더 올릴 수 있는가. 셀 수 없으면 막지 않는다 (올리기를 멈추는 것보다 낫다).
-pub fn within_quota(app: &AppState, email: &str) -> bool {
-    app.docs.uploads_today(email).map_or(true, |n| n < DAILY_UPLOADS)
-}
-
 /// 제목(필수, 200자)·프로젝트(100자) 규칙.
 pub fn check_meta(title: &str, project: &str) -> Result<(), &'static str> {
     if title.is_empty() {
@@ -1256,11 +1265,9 @@ pub async fn upload(State(app): State<AppState>, jar: PrivateCookieJar, form: Mu
         Ok(b) => b,
         Err(msg) => return upload_form(&app, &user, msg, (&form.title, &form.project)),
     };
-    if !within_quota(&app, &user.email) {
-        return upload_form(&app, &user, OVER_QUOTA, (&form.title, &form.project));
-    }
-    match app.docs.insert(&form.title, &form.project, &user, &bytes) {
-        Ok(id) => Redirect::to(&format!("/uploaded/{id}")).into_response(),
+    match app.docs.with_quota(&user.email, || app.docs.insert(&form.title, &form.project, &user, &bytes)) {
+        Ok(Some(id)) => Redirect::to(&format!("/uploaded/{id}")).into_response(),
+        Ok(None) => upload_form(&app, &user, OVER_QUOTA, (&form.title, &form.project)),
         Err(e) => server_error("문서 저장", e),
     }
 }
@@ -1420,11 +1427,9 @@ pub async fn replace(
         Ok(b) => b,
         Err(msg) => return replace_form(&app, &user, &doc, msg),
     };
-    if !within_quota(&app, &user.email) {
-        return replace_form(&app, &user, &doc, OVER_QUOTA);
-    }
-    match app.docs.replace(&id, &user, &bytes) {
-        Ok(_) => Redirect::to(&format!("/d/{id}/history")).into_response(),
+    match app.docs.with_quota(&user.email, || app.docs.replace(&id, &user, &bytes)) {
+        Ok(Some(_)) => Redirect::to(&format!("/d/{id}/history")).into_response(),
+        Ok(None) => replace_form(&app, &user, &doc, OVER_QUOTA),
         Err(e) => server_error("새 버전 저장", e),
     }
 }
