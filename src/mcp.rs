@@ -1,5 +1,5 @@
 //! 원격 MCP 서버와 그 로그인(OAuth 2.1). claude.ai·Claude 데스크톱·모바일의 커넥터와 Claude Code·Codex 가 붙는다.
-//! - MCP: `POST /mcp` (Streamable HTTP, 응답은 JSON 만). 도구는 upload_html 하나.
+//! - MCP: `POST /mcp` (Streamable HTTP, 응답은 JSON 만). 도구는 upload_html·update_html·list_documents.
 //! - OAuth: 메타데이터, 동적 등록(DCR), 승인 화면, 토큰 교환. PKCE(S256) 필수.
 //!   돌아갈 주소는 claude.ai·claude.com 콜백과 이 컴퓨터(loopback)만 받으므로, 등록한 클라이언트를 따로 저장하지 않는다.
 //! 직원 토큰(hh_)도 `Authorization: Bearer` 로 그대로 쓸 수 있다.
@@ -13,7 +13,7 @@ use crate::{
 use axum::{
     Form, Json,
     extract::{Query, State},
-    http::{HeaderMap, StatusCode, Uri, header},
+    http::{StatusCode, Uri, header},
     response::{IntoResponse, Redirect, Response},
 };
 use axum_extra::extract::cookie::PrivateCookieJar;
@@ -38,7 +38,6 @@ pub struct Grant {
 
 pub type Grants = Arc<Mutex<HashMap<String, Grant>>>;
 
-const TOKEN_TTL: u64 = 90 * 24 * 3600;
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
@@ -262,7 +261,7 @@ pub async fn token(State(app): State<AppState>, Form(f): Form<TokenForm>) -> Res
     match app.tokens.issue_oauth(&g.email, g.client) {
         Ok(t) => (
             [(header::CACHE_CONTROL, "no-store")],
-            Json(json!({ "access_token": t, "token_type": "Bearer", "expires_in": TOKEN_TTL })),
+            Json(json!({ "access_token": t, "token_type": "Bearer", "expires_in": crate::tokens::OAUTH_TTL })),
         )
             .into_response(),
         Err(e) => {
@@ -452,18 +451,23 @@ fn protocol_version(asked: Option<&str>) -> &str {
     asked.filter(|v| KNOWN.contains(v)).unwrap_or(KNOWN[0])
 }
 
-pub async fn mcp(State(app): State<AppState>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
-    let token = headers
+pub async fn mcp(State(app): State<AppState>, req: axum::extract::Request) -> Response {
+    let token = req
+        .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
+        .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")));
     // 토큰 주인이 명단에서 빠졌으면 토큰이 살아 있어도 막는다.
     let user = match token.map(|t| app.tokens.owner(t).map(|e| e.map(|e| app.users.find_active(&e)))) {
         Some(Ok(Some(Ok(Some(u))))) => u,
         Some(Err(_)) | Some(Ok(Some(Err(_)))) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         _ => return unauthorized(&app),
     };
-    // 토큰을 본 뒤에야 본문(최대 20MB)을 해석한다.
+    // 토큰을 본 뒤에야 본문(최대 20MB)을 받는다. 토큰 없는 요청이 큰 본문으로 메모리를 쓰게 하지 못한다.
+    let Ok(body) = axum::body::to_bytes(req.into_body(), crate::docs::MAX_BYTES * 2 + 64 * 1024).await else {
+        let e = json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32600, "message": "본문이 너무 크거나 읽지 못했습니다." } });
+        return (StatusCode::PAYLOAD_TOO_LARGE, Json(e)).into_response();
+    };
     let Ok(req) = serde_json::from_slice::<Value>(&body) else {
         let e = json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": "JSON 이 아닙니다." } });
         return (StatusCode::BAD_REQUEST, Json(e)).into_response();

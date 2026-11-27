@@ -146,7 +146,13 @@ pub async fn responses_page(State(app): State<AppState>, jar: PrivateCookieJar, 
             .iter()
             .zip(&rows)
             .map(|(r, row)| {
-                let answers: String = cols.iter().map(|c| format!("<td>{}</td>", escape(&cell(row.get(c))))).collect();
+                let answers: String = cols
+                    .iter()
+                    .map(|c| match cell(row.get(c)) {
+                        v if v.is_empty() => "<td class=\"zero\">—</td>".to_owned(),
+                        v => format!("<td>{}</td>", escape(&v)),
+                    })
+                    .collect();
                 format!(
                     "<tr><td class=\"by\">{}<time>{}</time></td>{answers}</tr>",
                     escape(&r.name),

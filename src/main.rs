@@ -204,7 +204,7 @@ async fn main() -> Result<()> {
         .layer(middleware::map_response(no_store));
 
     let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into());
-    println!("{addr} 에서 대기 중 ({base_url})");
+    log!("{addr} 에서 대기 중 ({base_url})");
     axum::serve(tokio::net::TcpListener::bind(&addr).await?, app).await?;
     Ok(())
 }

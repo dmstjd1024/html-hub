@@ -31,8 +31,8 @@ pub struct TokenInfo {
 /// 직원 토큰 기한 (1년). 새어 나간 토큰이 끝없이 쓰이지 않게 한다 (정책서 T5).
 const API_TTL: i64 = 365 * 24 * 3600;
 
-/// OAuth 토큰 기한 (90일). 지나면 Claude 쪽에서 다시 연결한다.
-const OAUTH_TTL: i64 = 90 * 24 * 3600;
+/// OAuth 토큰 기한 (90일). 지나면 Claude 쪽에서 다시 연결한다. 토큰 응답의 expires_in 도 이 값을 쓴다.
+pub const OAUTH_TTL: i64 = 90 * 24 * 3600;
 
 fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
@@ -150,6 +150,14 @@ impl Tokens {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// 살아 있는 OAuth 연결 전부 (이메일, 클라이언트). 관리자 화면용.
+    pub fn all_connections(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT email, client FROM oauth_tokens WHERE revoked_at IS NULL AND expires_at > ?1")?;
+        let rows = stmt.query_map([now_unix()], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn revoke_oauth(&self, email: &str) -> Result<()> {
         self.0.lock().unwrap().execute(
             "UPDATE oauth_tokens SET revoked_at = ?2 WHERE email = ?1 AND revoked_at IS NULL",
@@ -197,6 +205,12 @@ pub async fn tokens_page(State(app): State<AppState>, jar: PrivateCookieJar) -> 
             log!("토큰 조회 실패: {e}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
+    };
+    // 쓰고 있는 토큰이 있으면 새로 발급하기 전에 묻는다 (이전 토큰이 바로 폐기된다).
+    let reissue = if info.is_some() {
+        " onsubmit=\"return confirm('새 토큰을 발급하면 지금 토큰은 바로 폐기되어, 그 토큰을 쓰는 도구는 더 올리지 못합니다. 계속할까요?')\""
+    } else {
+        ""
     };
     let state = match info {
         Some(i) => format!(
@@ -250,7 +264,7 @@ pub async fn tokens_page(State(app): State<AppState>, jar: PrivateCookieJar) -> 
             "<div class=\"head\"><div><h1>내 토큰</h1>\
              <p class=\"lede\">도구가 문서를 올릴 때 쓰는 열쇠입니다. 이 토큰으로 올린 문서는 {} 님이 올린 것으로 기록되니 남에게 알려 주지 마세요.</p></div></div>\
              <div class=\"form\">{state}\
-             <form method=\"post\" action=\"/tokens\"><button class=\"btn\">새 토큰 발급</button></form>\
+             <form method=\"post\" action=\"/tokens\"{reissue}><button class=\"btn\">새 토큰 발급</button></form>\
              <p class=\"lede\" style=\"margin-top:8px;font-size:13px\">새로 발급하면 이전 토큰은 바로 폐기됩니다. 토큰은 발급하고 1년이 지나면 만료됩니다.</p>{claude}</div>",
             escape(&user.name)
         ),
@@ -328,22 +342,34 @@ pub async fn admin_tokens(State(app): State<AppState>, jar: PrivateCookieJar) ->
         Ok(_) => return admin_only(),
         Err(r) => return r,
     };
-    let list = match app.tokens.active() {
-        Ok(l) => l,
+    let (list, conns) = match app.tokens.active().and_then(|l| Ok((l, app.tokens.all_connections()?))) {
+        Ok(v) => v,
         Err(e) => {
             log!("토큰 목록 조회 실패: {e}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    // 직원 토큰이 없어도 연결만 있는 사람이 있으니 이메일을 합쳐 한 줄씩 보인다.
+    let mut emails: Vec<String> = list.iter().map(|(e, _)| e.clone()).chain(conns.iter().map(|(e, _)| e.clone())).collect();
+    emails.sort();
+    emails.dedup();
+    let list: Vec<(String, Option<&TokenInfo>, usize)> = emails
+        .into_iter()
+        .map(|e| {
+            let token = list.iter().find(|(x, _)| *x == e).map(|(_, i)| i);
+            let n = conns.iter().filter(|(x, _)| *x == e).count();
+            (e, token, n)
+        })
+        .collect();
     let rows: String = list
         .iter()
-        .map(|(email, i)| {
+        .map(|(email, token, n)| {
             format!(
-                "<tr><td>{email}</td><td class=\"when\">{}</td><td class=\"when\">{}</td><td class=\"actions\">\
-                 <form method=\"post\" action=\"/admin/tokens/revoke\" onsubmit=\"return confirm('{email} 의 토큰을 폐기할까요?')\">\
-                 <input type=\"hidden\" name=\"email\" value=\"{email}\"><button class=\"link danger\">폐기</button></form></td></tr>",
-                show_time(i.created_at),
-                i.last_used_at.map_or("없음".into(), show_time),
+                "<tr><td>{email}</td><td class=\"when\">{}</td><td class=\"when\">{}</td><td class=\"num\">{n}</td><td class=\"actions\">\
+                 <form method=\"post\" action=\"/admin/tokens/revoke\" onsubmit=\"return confirm('{email} 의 직원 토큰과 Claude·Codex 연결을 모두 끊을까요?')\">\
+                 <input type=\"hidden\" name=\"email\" value=\"{email}\"><button class=\"link danger\">모두 끊기</button></form></td></tr>",
+                token.map_or("없음".into(), |i| show_time(i.created_at)),
+                token.and_then(|i| i.last_used_at).map_or("없음".into(), show_time),
                 email = escape(email),
             )
         })
@@ -352,8 +378,8 @@ pub async fn admin_tokens(State(app): State<AppState>, jar: PrivateCookieJar) ->
         "<p class=\"empty\">발급된 토큰이 없습니다.</p>".to_owned()
     } else {
         format!(
-            "<div class=\"table-wrap narrow\"><table><thead><tr><th>직원</th><th>발급</th><th>마지막 사용</th>\
-             <th><span class=\"visually-hidden\">할 일</span></th></tr></thead><tbody>{rows}</tbody></table></div>"
+            "<div class=\"table-wrap narrow\"><table><thead><tr><th>직원</th><th>직원 토큰 발급</th><th>마지막 사용</th>\
+             <th class=\"num\">Claude·Codex 연결</th><th><span class=\"visually-hidden\">할 일</span></th></tr></thead><tbody>{rows}</tbody></table></div>"
         )
     };
     shell(
@@ -362,7 +388,7 @@ pub async fn admin_tokens(State(app): State<AppState>, jar: PrivateCookieJar) ->
         "/admin/tokens",
         &format!(
             "<div class=\"head\"><div><h1>토큰 관리</h1>\
-             <p class=\"lede\">토큰이 새었다면 여기서 폐기하세요. 폐기한 토큰으로는 더 올릴 수 없고, 직원은 내 토큰에서 새로 발급받을 수 있습니다.</p></div></div>{body}"
+             <p class=\"lede\">토큰이 새었다면 여기서 끊으세요. 직원 토큰과 Claude·Codex 연결이 함께 끊기고, 직원은 내 토큰에서 다시 발급·연결할 수 있습니다. 계정 자체를 막으려면 <code>html-hub user 이메일 off</code>.</p></div></div>{body}"
         ),
     )
     .into_response()
@@ -383,9 +409,10 @@ pub async fn admin_tokens_revoke(
         Ok(_) => return admin_only(),
         Err(r) => return r,
     };
-    match app.tokens.revoke(&form.email) {
+    // 직원 토큰과 Claude·Codex 연결(OAuth) 토큰을 함께 끊는다. 하나만 끊으면 새었을 때 다른 쪽으로 계속 올릴 수 있다.
+    match app.tokens.revoke(&form.email).and_then(|()| app.tokens.revoke_oauth(&form.email)) {
         Ok(()) => {
-            log!("관리자 토큰 폐기: {} 가 {} 의 토큰을 폐기", admin.email, form.email);
+            log!("관리자 토큰 폐기: {} 가 {} 의 직원 토큰과 연결을 모두 끊음", admin.email, form.email);
             Redirect::to("/admin/tokens").into_response()
         }
         Err(e) => {
@@ -404,7 +431,7 @@ pub async fn api_upload(State(app): State<AppState>, headers: HeaderMap, form: M
     let Some(token) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
+        .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
     else {
         return api_error(StatusCode::UNAUTHORIZED, "Authorization: Bearer 토큰이 필요합니다.");
     };
@@ -417,11 +444,8 @@ pub async fn api_upload(State(app): State<AppState>, headers: HeaderMap, form: M
         Ok(f) => f,
         Err(msg) => return api_error(StatusCode::BAD_REQUEST, msg),
     };
-    if form.title.is_empty() {
-        return api_error(StatusCode::BAD_REQUEST, "title 이 필요합니다.");
-    }
-    if form.title.chars().count() > 200 || form.project.chars().count() > 100 {
-        return api_error(StatusCode::BAD_REQUEST, "title 은 200자, project 는 100자 이하여야 합니다.");
+    if let Err(msg) = crate::docs::check_meta(&form.title, &form.project) {
+        return api_error(StatusCode::BAD_REQUEST, msg);
     }
     let bytes = match check_file(form.file) {
         Ok(b) => b,

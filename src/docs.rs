@@ -111,7 +111,8 @@ pub struct Doc {
 }
 
 /// 문서 메타데이터(SQLite)와 파일(디스크)을 함께 다룬다.
-/// 파일 저장은 put_file/read_file 두 곳뿐이라 R2 로 옮길 때 여기만 바꾼다.
+/// 파일을 다루는 곳: put_file/read_file, replace 의 이름 바꾸기, purge 의 지우기와 purged.txt, ping 의 폴더 확인.
+/// R2 로 옮길 때는 이 다섯 곳과 scripts/backup.sh 를 함께 바꾼다.
 #[derive(Clone)]
 pub struct Docs {
     db: Arc<Mutex<Connection>>,
@@ -122,6 +123,8 @@ impl Docs {
     pub fn open(db_path: &str, dir: &str) -> Result<Self> {
         let conn = Connection::open(db_path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
+        // WAL: 쓰는 동안에도 읽기가 막히지 않는다. DB 파일에 남으므로 한 번 켜면 계속 간다.
+        conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS documents (
                 id TEXT PRIMARY KEY,
@@ -160,6 +163,10 @@ impl Docs {
             );
             -- 북극성 지표(주간 열람된 문서 수)용. 누가 봤는지는 남기지 않는다.
             CREATE TABLE IF NOT EXISTS views (doc_id TEXT NOT NULL, at INTEGER NOT NULL);
+            -- 열람·댓글은 화면마다 센다. 쌓여도 느려지지 않게 색인을 둔다.
+            CREATE INDEX IF NOT EXISTS views_doc_at ON views(doc_id, at);
+            CREATE INDEX IF NOT EXISTS views_at ON views(at);
+            CREATE INDEX IF NOT EXISTS comments_doc ON comments(doc_id);
             -- 설문 응답. 한 사람이 한 문서에 하나만 남기고, 다시 내면 덮어쓴다. answers 는 JSON 객체다.
             CREATE TABLE IF NOT EXISTS responses (
                 doc_id TEXT NOT NULL,
@@ -206,6 +213,13 @@ impl Docs {
         Ok(())
     }
 
+    /// 저장은 이미 끝났으므로 검색 색인이 실패해도 올리기는 성공으로 둔다 (실패로 답하면 다시 올려 중복이 생긴다).
+    fn index_quietly(&self, id: &str, bytes: &[u8]) {
+        if let Err(e) = self.index_body(id, bytes) {
+            log!("본문 색인 실패 (검색에 옛 내용이 걸릴 수 있다): {id}: {e}");
+        }
+    }
+
     fn put_file(&self, name: &str, bytes: &[u8]) -> Result<()> {
         Ok(std::fs::write(self.dir.join(name), bytes)?)
     }
@@ -233,7 +247,7 @@ impl Docs {
         )?;
         tx.commit()?;
         drop(conn);
-        self.index_body(&id, bytes)?;
+        self.index_quietly(&id, bytes);
         Ok(id)
     }
 
@@ -250,21 +264,30 @@ impl Docs {
 
     /// 같은 문서에 새 버전을 올린다. 이전 버전은 이력으로 남는다 (정책서 V1·V2).
     pub fn replace(&self, id: &str, by: &crate::users::User, bytes: &[u8]) -> Result<i64> {
-        let n = self.add_version(id, by, |n| {
+        // 큰 파일은 DB 잠금 밖에서 먼저 쓰고, 잠금 안에서는 번호를 매겨 이름만 바꾼다.
+        let tmp = format!("{id}-tmp-{}.html", CsrfToken::new_random().secret());
+        self.put_file(&tmp, bytes)?;
+        let added = self.add_version(id, by, |n| {
             let file = format!("{id}-{n}.html");
-            self.put_file(&file, bytes)?;
+            std::fs::rename(self.dir.join(&tmp), self.dir.join(&file))?;
             Ok(file)
-        })?;
-        self.index_body(id, bytes)?;
+        });
+        if added.is_err() {
+            let _ = std::fs::remove_file(self.dir.join(&tmp));
+        }
+        let n = added?;
+        self.index_quietly(id, bytes);
         Ok(n)
     }
 
     /// 이전 버전의 내용을 새 버전으로 한 번 더 저장한다. 사이의 버전은 지우지 않는다 (V8). 없는 버전이면 None.
     pub fn restore(&self, id: &str, n: i64, by: &crate::users::User) -> Result<Option<i64>> {
         let Some(file) = self.version_file(id, n)? else { return Ok(None) };
+        // 파일이 없으면 버전을 만들기 전에 실패해야 현재 버전이 깨지지 않는다.
+        let bytes = self.read_file(&file)?;
         // 파일은 바뀌지 않으므로 같은 파일을 새 버전이 가리키게 한다.
         let n = self.add_version(id, by, |_| Ok(file.clone()))?;
-        self.index_body(id, &self.read_file(&file)?)?;
+        self.index_quietly(id, &bytes);
         Ok(Some(n))
     }
 
@@ -330,7 +353,8 @@ impl Docs {
 
     /// 상태 확인: DB 를 읽을 수 있고 문서 폴더가 있는가.
     pub fn ping(&self) -> Result<()> {
-        self.db.lock().unwrap().query_row("SELECT 1", [], |_| Ok(()))?;
+        // SELECT 1 은 DB 파일을 읽지 않는다. 실제 표를 읽는다.
+        self.db.lock().unwrap().query_row("SELECT COUNT(*) FROM documents", [], |_| Ok(()))?;
         anyhow::ensure!(self.dir.is_dir(), "문서 폴더가 없다: {}", self.dir.display());
         Ok(())
     }
@@ -514,19 +538,24 @@ impl Docs {
             tx.execute(&format!("DELETE FROM {table} WHERE doc_id = ?1"), [id])?;
         }
         tx.execute("DELETE FROM documents WHERE id = ?1", [id])?;
-        // 백업 정리용 목록을 먼저 쓴다. 못 쓰면 기록을 지우지 않고(되돌림) 다시 시도할 수 있게 한다.
-        {
-            use std::io::Write;
-            let mut list = std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join("..").join("purged.txt"))?;
-            for f in &files {
-                writeln!(list, "{f}")?;
-            }
-        }
+        // 기록을 먼저 지운다(커밋). 목록을 먼저 쓰면 커밋이 실패했을 때 살아 있는 문서의 백업까지 지워진다.
         tx.commit()?;
         drop(conn);
         for f in &files {
-            // 파일이 이미 없으면 그대로 둔다. 기록은 지웠으므로 다시 보이지 않는다.
-            let _ = std::fs::remove_file(self.dir.join(f));
+            match std::fs::remove_file(self.dir.join(f)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => log!("완전 삭제: 파일을 못 지웠다 (손으로 지워야 한다): {f}: {e}"),
+            }
+        }
+        use std::io::Write;
+        let listed = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join("..").join("purged.txt"))
+            .and_then(|mut list| files.iter().try_for_each(|f| writeln!(list, "{f}")));
+        if let Err(e) = listed {
+            log!("완전 삭제: 백업 정리 목록을 못 썼다 (백업 폴더에서 손으로 지워야 한다): {files:?}: {e}");
         }
         Ok(true)
     }
@@ -939,7 +968,7 @@ pub async fn index(
         .map(|d| {
             let id = escape(&d.id);
             let title = escape(&d.title);
-            let confirm = "onsubmit=\"return confirm('이 문서를 목록에서 숨길까요? 관리자가 다시 살릴 수 있습니다.')\"";
+            let confirm = "onsubmit=\"return confirm('이 문서를 삭제할까요? 목록과 검색에서 사라지고, 관리자가 다시 살릴 수 있습니다.')\"";
             let (delete, delete_menu) = if can_modify(&user, d) {
                 (
                     format!("<form method=\"post\" action=\"/d/{id}/delete\" {confirm}><button class=\"link danger\">삭제</button></form>"),
@@ -1084,7 +1113,7 @@ pub async fn index(
         &user,
         "/",
         &format!(
-            "<div class=\"head\"><div><h1>문서<small>{total}개</small></h1>\
+            "<div class=\"head dash\"><div><h1>문서<small>{total}개</small></h1>\
              <p class=\"lede\">팀이 Claude로 만든 HTML 결과물을 링크로 열고 찾습니다.</p></div>\
              <a class=\"btn\" href=\"/upload\">HTML 올리기</a></div>\
              <form class=\"search\" method=\"get\" action=\"/\" role=\"search\"><span class=\"mag\" aria-hidden=\"true\"></span>\
@@ -1220,11 +1249,8 @@ pub async fn upload(State(app): State<AppState>, jar: PrivateCookieJar, form: Mu
         Ok(f) => f,
         Err(msg) => return upload_form(&app, &user, msg, ("", "")),
     };
-    if form.title.is_empty() {
-        return upload_form(&app, &user, "제목을 입력해 주세요.", (&form.title, &form.project));
-    }
-    if form.title.chars().count() > 200 || form.project.chars().count() > 100 {
-        return upload_form(&app, &user, "제목은 200자, 프로젝트는 100자 이하로 입력해 주세요.", (&form.title, &form.project));
+    if let Err(msg) = check_meta(&form.title, &form.project) {
+        return upload_form(&app, &user, msg, (&form.title, &form.project));
     }
     let bytes = match check_file(form.file) {
         Ok(b) => b,
@@ -1662,12 +1688,12 @@ pub async fn view(State(app): State<AppState>, jar: PrivateCookieJar, Path(id): 
         &doc.title,
         &format!(
             "<div class=\"viewer\"><header class=\"vbar\"><a class=\"brand\" href=\"/\">html-hub</a>\
-             <h1 class=\"vtitle\">{title}</h1><nav aria-label=\"문서 메뉴\">\
+             <h1 class=\"vtitle\" title=\"{title}\">{title}</h1><nav aria-label=\"문서 메뉴\">\
              <a href=\"/d/{id}/comments\">댓글<span class=\"n\">{comments}</span></a><a href=\"/d/{id}/history\">이력</a>{responses}\
              <a class=\"opt\" href=\"/d/{id}/raw\" target=\"_blank\" rel=\"noopener\">새 창</a></nav></header>\
-             <iframe id=\"doc\" src=\"/d/{id}/raw\" title=\"{title}\" \
+             <main class=\"vmain\" id=\"main\"><iframe id=\"doc\" src=\"/d/{id}/raw\" title=\"{title}\" \
              sandbox=\"allow-scripts allow-popups allow-popups-to-escape-sandbox allow-modals allow-forms allow-downloads\" \
-             allow=\"fullscreen; clipboard-write\"></iframe></div>{}",
+             allow=\"fullscreen; clipboard-write\"></iframe></main></div>{}",
             crate::survey::confirm_dialog(&user.name)
         ),
     )

@@ -33,7 +33,7 @@ pub fn to_html(filename: &str, bytes: &[u8]) -> Option<Result<Vec<u8>, &'static 
 }
 
 const MERMAID_RUN: &str = "<script type=\"module\">import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';\
-     mermaid.initialize({startOnLoad:false});await mermaid.run();</script>";
+     mermaid.initialize({startOnLoad:false,theme:matchMedia('(prefers-color-scheme: dark)').matches?'dark':'default'});await mermaid.run();</script>";
 
 // 서버에서 그려 두면 자바스크립트 없이 보이고 본문 검색에도 걸린다.
 fn markdown(text: &str) -> String {
@@ -54,7 +54,7 @@ fn markdown(text: &str) -> String {
          table{{border-collapse:collapse;display:block;overflow-x:auto}}th,td{{border:1px solid #d1d9e0;padding:6px 12px}}th{{background:#f6f8fa}}\
          code{{background:#eff1f3;padding:.1em .4em;border-radius:4px;font-size:.9em}}pre{{background:#f6f8fa;padding:14px;border-radius:6px;overflow-x:auto}}pre code{{background:none;padding:0}}\
          blockquote{{margin:0;padding:0 1em;color:#59636e;border-left:4px solid #d1d9e0}}img{{max-width:100%}}\
-         @media (prefers-color-scheme:dark){{body{{background:#0d1117;color:#e6edf3}}th,pre{{background:#161b22}}code{{background:#262c36}}th,td,h1,h2{{border-color:#3d444d}}}}</style>\
+         @media (prefers-color-scheme:dark){{body{{background:#0d1117;color:#e6edf3}}th,pre{{background:#161b22}}code{{background:#262c36}}th,td,h1,h2{{border-color:#3d444d}}blockquote{{color:#9198a1;border-color:#3d444d}}}}</style>\
          </head><body>{body}{diagrams}</body></html>"
     )
 }

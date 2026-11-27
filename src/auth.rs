@@ -100,6 +100,9 @@ const CSS: &str = r#"
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 "IBM Plex Sans KR",system-ui,-apple-system,"Apple SD Gothic Neo",sans-serif;font-variant-numeric:tabular-nums;word-break:keep-all;overflow-wrap:anywhere}
 a{color:var(--leaf-ink)}
 :focus-visible{outline:2px solid var(--leaf-ink);outline-offset:2px;border-radius:4px}
+.rail :focus-visible,.mbar :focus-visible,.mtabs :focus-visible,.vbar :focus-visible{outline-color:#CBDAD3}
+.skip{position:absolute;left:8px;top:-48px;z-index:20;background:var(--surface);color:var(--leaf-ink);padding:8px 12px;border-radius:6px}
+.skip:focus{top:8px}
 h1{font-size:24px;font-weight:600;line-height:1.3;margin:0 0 4px}
 h2{font-size:15px;font-weight:600;margin:0 0 10px}
 .lede{color:var(--ink-2);margin:0}
@@ -114,7 +117,7 @@ time{white-space:nowrap}
 .rail nav a{display:flex;align-items:center;color:#C9D8CE;text-decoration:none;padding:8px 12px;border-radius:6px}
 .rail nav a:hover{color:#fff;background:rgba(255,255,255,.06)}
 .rail nav a[aria-current=page]{color:#fff;background:rgba(255,255,255,.12);font-weight:500}
-.rail .count{margin-left:auto;font-size:12px;color:#8FA698}
+.rail .count{margin-left:auto;font-size:12px;color:#B8CBBF}
 .rail .group{font-size:12px;color:#8FA698;padding:20px 12px 6px}
 .who{margin-top:auto;display:flex;align-items:center;gap:10px;padding:14px 12px 0;border-top:1px solid rgba(255,255,255,.1);font-size:13px;min-width:0}
 .who div{min-width:0;flex:1}
@@ -164,7 +167,7 @@ input[type=file]::file-selector-button{height:32px;padding:0 12px;margin:0 12px 
 .stats dd{margin:2px 0 0;font-size:28px;font-weight:600;line-height:1.2}
 .stats dd small{font-size:15px;font-weight:400;color:var(--ink-3)}
 .stats .sub{display:block;font-size:12px;font-weight:400;line-height:1.5;color:var(--ink-2);margin-top:4px}
-.stats .sub a{text-decoration:none;font-weight:500}
+.stats .sub a{display:inline-block;padding:6px 0;text-decoration:none;font-weight:500}
 .stats .with-spark{position:relative}
 .spark-box{position:absolute;right:18px;bottom:14px}
 .spark{display:grid;grid-template-columns:repeat(7,7px);gap:4px;align-items:end;height:30px}
@@ -179,7 +182,7 @@ input[type=file]::file-selector-button{height:32px;padding:0 12px;margin:0 12px 
 .chips a,.chips>span{font-size:13px;padding:4px 12px;border-radius:999px;background:var(--surface);border:1px solid var(--line);color:var(--ink);text-decoration:none;white-space:nowrap}
 .chips a .n{color:var(--ink-3);margin-left:4px}
 .chips a[aria-current=true],.chips>span[aria-current]{background:var(--leaf);border-color:var(--leaf);color:var(--on-leaf)}
-.chips a[aria-current=true] .n{color:inherit;opacity:.75}
+.chips a[aria-current=true] .n{color:inherit;opacity:.9}
 .sort{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--ink-2)}
 .sort select{width:auto;padding:5px 10px;font-size:13px}
 .result{color:var(--ink-2);font-size:14px;margin:0 0 8px}
@@ -195,7 +198,7 @@ th.num,td.num{text-align:right}
 .sort-link:hover{color:var(--ink);text-decoration:underline}
 td.num{white-space:nowrap}
 td.t{width:40%;max-width:0}
-.doc-title{display:block;color:var(--ink);font-weight:500;text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.doc-title{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;color:var(--ink);font-weight:500;text-decoration:none;overflow:hidden}
 .doc-title:hover{color:var(--leaf-ink);text-decoration:underline}
 .excerpt{display:block;font-size:13px;color:var(--ink-2);margin-top:2px;white-space:normal}
 .by{font-size:14px;white-space:nowrap}
@@ -286,7 +289,8 @@ dialog.ask::backdrop{background:rgba(0,0,0,.4)}
 dialog.ask h2{font-size:17px}
 dialog.ask ul{margin:8px 0 16px;padding-left:18px;max-height:40vh;overflow:auto;font-size:14px;color:var(--ink-2)}
 dialog.ask form{display:flex;gap:8px;justify-content:flex-end}
-@media (max-width:560px){.vbar .brand,.vbar nav a.opt{display:none}}
+.vmain{flex:1;display:flex;min-height:0}
+@media (max-width:560px){.vbar nav a.opt{display:none}}
 @media (max-width:1200px){.grid{grid-template-columns:minmax(0,1fr)}.side{display:grid;grid-template-columns:1fr 1fr;gap:24px}}
 @media (max-width:860px){
 .app{display:block}
@@ -297,7 +301,7 @@ dialog.ask form{display:flex;gap:8px;justify-content:flex-end}
 .mtabs::-webkit-scrollbar{display:none}
 .mtabs a{display:flex;align-items:center;padding:0 10px;font-size:14.5px;color:#C9D8CE;text-decoration:none;white-space:nowrap;border-bottom:2px solid transparent}
 .mtabs a[aria-current=page]{color:#fff;font-weight:600;border-color:#8FCBA8}
-.mtabs .count{font-size:12px;color:#8FA698;margin-left:4px}
+.mtabs .count{font-size:12px;color:#B8CBBF;margin-left:4px}
 .mtabs .group,.mtabs a[href="/upload"]{display:none}
 .menu{position:relative}
 .menu summary{list-style:none;cursor:pointer;display:grid;place-items:center;width:44px;height:44px}
@@ -307,7 +311,7 @@ dialog.ask form{display:flex;gap:8px;justify-content:flex-end}
 .menu .me button{display:block;width:100%;text-align:left;background:none;border:0;border-top:1px solid var(--line-2);margin-top:8px;font:inherit;color:var(--leaf-ink);min-height:44px;cursor:pointer}
 .main{padding:16px 16px 40px}
 .head{margin-bottom:12px}
-.head .btn,.head .lede{display:none}
+.head.dash .btn,.head.dash .lede{display:none}
 .stats{grid-template-columns:repeat(3,1fr)}
 .stats>div{padding:10px 12px;display:flex;flex-direction:column;justify-content:flex-start}
 .stats dt{font-size:12px;line-height:1.4}
@@ -413,14 +417,17 @@ pub(crate) fn shell(app: &AppState, user: &User, current: &str, body: &str) -> H
     let (name, email, initial) = (escape(&user.name), escape(&user.email), escape(&initial));
     let logout = "<form method=\"post\" action=\"/logout\"><button>로그아웃</button></form>";
     document(&format!(
-        "<header class=\"mbar\"><a class=\"brand\" href=\"/\">html-hub</a><a class=\"btn sm\" href=\"/upload\">올리기</a>\
+        "<a class=\"skip\" href=\"#main\">본문으로 건너뛰기</a><header class=\"mbar\"><a class=\"brand\" href=\"/\">html-hub</a><a class=\"btn sm\" href=\"/upload\">올리기</a>\
          <details class=\"menu\"><summary aria-label=\"내 계정\"><span class=\"avatar\">{initial}</span></summary>\
          <div><div class=\"me\">{name}<br>{email}{logout}</div></div></details></header>\
          <nav class=\"mtabs\" aria-label=\"메뉴\">{nav}</nav>\
          <div class=\"app\"><aside class=\"rail\" aria-label=\"사이드 메뉴\"><a class=\"brand\" href=\"/\">html-hub<small>Greenery</small></a>\
          <nav aria-label=\"메뉴\">{nav}</nav>\
          <div class=\"who\"><span class=\"avatar\">{initial}</span><div><b>{name}</b><small>{email}</small></div>{logout}</div></aside>\
-         <main class=\"main\">{body}</main></div>"
+         <main class=\"main\" id=\"main\">{body}</main></div>\
+         <script>(function(){{function close(e){{document.querySelectorAll('details.rowmenu[open],details.menu[open]').forEach(function(d){{\
+         if(e.type==='keydown'?e.key==='Escape':!d.contains(e.target))d.removeAttribute('open')}})}}\
+         document.addEventListener('click',close);document.addEventListener('keydown',close)}})()</script>"
     ))
 }
 

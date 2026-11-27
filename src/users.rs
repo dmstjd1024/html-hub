@@ -39,6 +39,8 @@ struct ExportUser {
 impl Users {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
+        // 같은 DB 를 docs·tokens 도 따로 연다. 쓰는 순간 바로 실패하지 않게 기다린다.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS users (
                 email TEXT PRIMARY KEY,

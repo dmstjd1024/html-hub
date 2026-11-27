@@ -77,7 +77,11 @@ def handle(msg):
 for line in sys.stdin:
     if not line.strip():
         continue
-    msg = json.loads(line)
+    try:
+        msg = json.loads(line)
+    except ValueError:  # 깨진 줄 하나로 서버가 죽지 않게 한다
+        print(json.dumps({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "JSON 이 아닙니다"}}), flush=True)
+        continue
     try:
         result = handle(msg)
         if msg.get("id") is not None and result is not None:

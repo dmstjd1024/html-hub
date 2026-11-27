@@ -1114,3 +1114,45 @@ async fn 관리자는_숨긴_문서를_흔적까지_지운다() {
     assert!(files.iter().all(|f| purged.lines().any(|l| l == f)), "{purged}");
     assert_eq!(s.get(&format!("/d/{id}"), Some(&admin)).await.status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn 관리자_폐기와_계정_끄기는_claude_연결도_막고_되돌리기는_파일이_없으면_현재를_지킨다() {
+    use sha2::{Digest, Sha256};
+    let s = Server::start().await;
+    let (owner, admin) = (s.login(OWNER), s.login(ADMIN));
+    let ping = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" });
+    // Claude 연결(OAuth) 토큰을 하나 심는다. 서버는 해시만 저장한다.
+    let plant = |who: &str, tok: &str| {
+        s.db()
+            .execute(
+                "INSERT INTO oauth_tokens (hash, email, client, created_at, expires_at) VALUES (?1, ?2, 'Claude', strftime('%s','now'), strftime('%s','now') + 3600)",
+                rusqlite::params![format!("{:x}", Sha256::digest(tok.as_bytes())), who],
+            )
+            .unwrap();
+    };
+    plant(OWNER, "hho_owner");
+    let staff = issue_token(&s, &owner).await;
+    assert_eq!(send_json(&s, "/mcp", Some("hho_owner"), ping.clone()).await.status, StatusCode::OK);
+    let page = s.get("/admin/tokens", Some(&admin)).await.body;
+    assert!(page.contains(OWNER) && page.contains("Claude·Codex 연결"), "{page}");
+
+    // 관리자가 끊으면 직원 토큰과 연결이 함께 막힌다.
+    assert_eq!(s.post("/admin/tokens/revoke", Some(&admin), &[("email", OWNER)]).await.status, StatusCode::SEE_OTHER);
+    assert_eq!(send_json(&s, "/mcp", Some("hho_owner"), ping.clone()).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(send_json(&s, "/mcp", Some(&staff), ping.clone()).await.status, StatusCode::UNAUTHORIZED);
+
+    // 명단에서 꺼진 사람의 연결 토큰은 살아 있어도 못 쓴다.
+    plant(OTHER, "hho_other");
+    assert_eq!(send_json(&s, "/mcp", Some("hho_other"), ping.clone()).await.status, StatusCode::OK);
+    s.db().execute("UPDATE users SET active = 0 WHERE email = ?1", [OTHER]).unwrap();
+    assert_eq!(send_json(&s, "/mcp", Some("hho_other"), ping).await.status, StatusCode::UNAUTHORIZED);
+
+    // 되돌릴 버전의 파일이 없으면 실패하되, 새 버전을 만들지 않아 현재 버전은 그대로 열린다.
+    let id = s.upload(&owner, "되돌리기", "", "<p>v1</p>").await;
+    s.multipart(&format!("/d/{id}/replace"), Some(&owner), None, &[], Some(("b.html", b"<p>v2</p>"))).await;
+    std::fs::remove_file(s.dir.join("files").join(format!("{id}.html"))).unwrap();
+    assert_eq!(s.post(&format!("/d/{id}/restore/1"), Some(&owner), &[]).await.status, StatusCode::INTERNAL_SERVER_ERROR);
+    let n: i64 = s.db().query_row("SELECT COUNT(*) FROM versions WHERE doc_id = ?1", [&id], |r| r.get(0)).unwrap();
+    assert_eq!(n, 2);
+    assert_eq!(original(&s.get(&format!("/d/{id}/raw"), Some(&owner)).await.body), "<p>v2</p>");
+}
