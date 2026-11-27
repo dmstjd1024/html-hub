@@ -13,7 +13,8 @@ TOOL = {
     "description": "survey(html-hub, 사내 HTML 문서 공유 사이트)에 문서를 올리고 공유 링크를 돌려준다. "
                    "Claude 가 만든 아티팩트는 내용 전체를 content 에 넣고, 이미 파일로 있으면 file_path 를 준다. "
                    ".html 외에 Markdown, SVG, Mermaid, React(.jsx, export default 컴포넌트)도 받아 서버가 HTML 로 감싼다. "
-                   "올린 문서는 전 직원이 볼 수 있다.",
+                   "올린 문서는 전 직원이 볼 수 있다. "
+                   "설문을 만들 때는 문서 스크립트에서 window.htmlhub.submit({질문: 답}) 을 부르면 된다 (Promise, 실패하면 Error). 응답은 보고 있는 직원 이름으로 저장되고 한 사람이 다시 내면 덮어쓰며, 올린 사람과 관리자만 html-hub 의 '응답' 탭과 CSV 로 본다. 제출 성공·실패를 화면에 보여 줄 것.",
     "inputSchema": {
         "type": "object",
         "properties": {

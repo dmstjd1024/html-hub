@@ -949,3 +949,75 @@ async fn 원격_mcp_는_oauth_로_연결해_올린다() {
     let batch = send_json(&s, "/mcp", Some(&staff), serde_json::json!([rpc(7, "ping", serde_json::json!({}))])).await;
     assert_eq!(json(&batch)["error"]["code"], -32600, "배치는 오류로 답한다");
 }
+
+// ---------- 설문 ----------
+
+/// 격리된 문서가 보내듯 Origin: null, text/plain 으로 응답을 낸다. 쿠키는 없다.
+async fn submit_answers(s: &Server, doc: &str, body: serde_json::Value) -> Res {
+    let req = s
+        .http
+        .post(format!("{}/d/{doc}/responses", s.base))
+        .header(header::ORIGIN, "null")
+        .header(header::CONTENT_TYPE, "text/plain")
+        .body(body.to_string());
+    s.send(req, None).await
+}
+
+fn submit_key(body: &str) -> String {
+    body.split("key:'").nth(1).expect("문서에 제출 함수가 들어 있어야 한다").split('\'').next().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn 설문_응답은_보는_직원_이름으로_모이고_올린_사람만_본다() {
+    use serde_json::json;
+    let s = Server::start().await;
+    let (owner, other, admin) = (s.login(OWNER), s.login(OTHER), s.login(ADMIN));
+    let html = "<!doctype html><form>만족도 조사</form>";
+    let id = s.upload(&owner, "만족도 조사", "운영", html).await;
+    let id2 = s.upload(&owner, "다른 문서", "", "<p>x</p>").await;
+
+    // 문서를 열면 제출 함수가 같은 script 에 들어가고, 원본은 그대로다.
+    let r = s.get(&format!("/d/{id}"), Some(&other)).await;
+    assert!(r.body.contains("window.htmlhub="));
+    assert_eq!(original(&r.body), html);
+    let key = submit_key(&r.body);
+
+    // 낸다. 결과를 문서가 읽을 수 있게 CORS 를 연다.
+    let r = submit_answers(&s, &id, json!({ "key": key, "answers": { "만족도": 5, "의견": "=좋아요", "고른 것": ["A", "B"] } })).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(r.headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+    // 다시 내면 덮어쓴다.
+    let r = submit_answers(&s, &id, json!({ "key": key, "answers": { "만족도": 4, "의견": "=좋아요", "고른 것": ["A", "B"] } })).await;
+    assert_eq!(r.status, StatusCode::OK);
+
+    // 열쇠가 틀리거나 다른 문서의 것이면 받지 않는다. 답은 객체여야 한다.
+    let wrong = submit_answers(&s, &id, json!({ "key": "nope", "answers": {} })).await;
+    assert_eq!(wrong.status, StatusCode::UNAUTHORIZED);
+    assert!(wrong.body.contains("새로고침"));
+    assert_eq!(submit_answers(&s, &id2, json!({ "key": key, "answers": {} })).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(submit_answers(&s, &id, json!({ "key": key, "answers": [1] })).await.status, StatusCode::BAD_REQUEST);
+    assert_eq!(submit_answers(&s, &id, json!({ "key": key, "answers": { "x": "a".repeat(70_000) } })).await.status, StatusCode::PAYLOAD_TOO_LARGE);
+
+    let admin_key = submit_key(&s.get(&format!("/d/{id}"), Some(&admin)).await.body);
+    assert_eq!(submit_answers(&s, &id, json!({ "key": admin_key, "answers": { "만족도": 3, "추가 질문": "네" } })).await.status, StatusCode::OK);
+
+    // 결과는 올린 사람과 관리자만 본다.
+    assert_eq!(s.get(&format!("/d/{id}/responses"), Some(&other)).await.status, StatusCode::FORBIDDEN);
+    assert_eq!(s.get(&format!("/d/{id}/responses.csv"), Some(&other)).await.status, StatusCode::FORBIDDEN);
+    assert_eq!(s.get(&format!("/d/{id}/responses"), Some(&admin)).await.status, StatusCode::OK);
+    let page = s.get(&format!("/d/{id}/responses"), Some(&owner)).await.body;
+    let other_name: String = s.db().query_row("SELECT name FROM users WHERE email = ?1", [OTHER], |r| r.get(0)).unwrap();
+    assert!(page.contains("응답 2명") && page.contains(&other_name) && page.contains("A, B"), "{page}");
+    let cols: Vec<_> = ["만족도", "의견", "고른 것", "추가 질문"].iter().map(|c| page.find(&format!(">{c}</th>")).unwrap()).collect();
+    assert!(cols.windows(2).all(|w| w[0] < w[1]), "질문은 처음 나온 순서대로");
+    assert!(page.contains("<td>4</td>") && !page.contains("<td>5</td>"), "다시 낸 답으로 덮어쓴다");
+
+    // 응답이 있는 문서에만 응답 탭이 생긴다.
+    assert!(s.get(&format!("/d/{id}/history"), Some(&owner)).await.body.contains(&format!("/d/{id}/responses")));
+    assert!(!s.get(&format!("/d/{id2}/history"), Some(&owner)).await.body.contains("/responses"));
+
+    // CSV: 엑셀용 BOM, 질문 순서, 수식 무력화.
+    let csv = s.get(&format!("/d/{id}/responses.csv"), Some(&owner)).await.body;
+    assert!(csv.starts_with("\u{feff}\"이름\",\"이메일\",\"제출 시각\",\"만족도\",\"의견\",\"고른 것\",\"추가 질문\"\r\n"), "{csv}");
+    assert!(csv.contains("\"'=좋아요\"") && csv.contains(OTHER), "{csv}");
+}

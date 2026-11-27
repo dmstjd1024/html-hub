@@ -94,6 +94,13 @@ pub struct Version {
     pub created_at: i64,
 }
 
+pub struct SurveyResponse {
+    pub email: String,
+    pub name: String,
+    pub answers: String,
+    pub updated_at: i64,
+}
+
 pub struct Doc {
     pub id: String,
     pub title: String,
@@ -152,7 +159,17 @@ impl Docs {
                 deleted_at INTEGER
             );
             -- 북극성 지표(주간 열람된 문서 수)용. 누가 봤는지는 남기지 않는다.
-            CREATE TABLE IF NOT EXISTS views (doc_id TEXT NOT NULL, at INTEGER NOT NULL);",
+            CREATE TABLE IF NOT EXISTS views (doc_id TEXT NOT NULL, at INTEGER NOT NULL);
+            -- 설문 응답. 한 사람이 한 문서에 하나만 남기고, 다시 내면 덮어쓴다. answers 는 JSON 객체다.
+            CREATE TABLE IF NOT EXISTS responses (
+                doc_id TEXT NOT NULL,
+                email TEXT NOT NULL,
+                name TEXT NOT NULL,
+                answers TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (doc_id, email)
+            );",
         )?;
         std::fs::create_dir_all(dir)?;
         let docs = Self {
@@ -294,6 +311,29 @@ impl Docs {
             params![id, by.email, by.name, body, now_unix()],
         )?;
         Ok(())
+    }
+
+    pub fn save_response(&self, id: &str, user: &crate::users::User, answers: &str) -> Result<()> {
+        self.db.lock().unwrap().execute(
+            "INSERT INTO responses (doc_id, email, name, answers, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+             ON CONFLICT (doc_id, email) DO UPDATE SET name = excluded.name, answers = excluded.answers, updated_at = excluded.updated_at",
+            params![id, user.email, user.name, answers, now_unix()],
+        )?;
+        Ok(())
+    }
+
+    /// 설문 응답을 먼저 낸 사람부터 돌려준다.
+    pub fn responses(&self, id: &str) -> Result<Vec<SurveyResponse>> {
+        let conn = self.db.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT email, name, answers, updated_at FROM responses WHERE doc_id = ?1 ORDER BY created_at, rowid")?;
+        let rows = stmt.query_map([id], |r| {
+            Ok(SurveyResponse { email: r.get(0)?, name: r.get(1)?, answers: r.get(2)?, updated_at: r.get(3)? })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn response_count(&self, id: &str) -> Result<i64> {
+        Ok(self.db.lock().unwrap().query_row("SELECT COUNT(*) FROM responses WHERE doc_id = ?1", [id], |r| r.get(0))?)
     }
 
     /// 지우지 않은 댓글을 오래된 것부터 돌려준다.
@@ -614,11 +654,11 @@ pub fn when(unix: i64) -> String {
 
 /// 격리된 문서는 출처가 없어(opaque origin) localStorage·sessionStorage 가 SecurityError 를 던진다.
 /// 그러면 저장소를 쓰는 React 앱이 통째로 멈추므로, 막혔을 때만 메모리 저장소로 바꿔 끼운다 (새로고침하면 사라진다).
-const STORAGE_SHIM: &str = "<script>(function(){function m(){var d={};return{getItem:function(k){return Object.prototype.hasOwnProperty.call(d,k)?d[k]:null},setItem:function(k,v){d[k]=String(v)},removeItem:function(k){delete d[k]},clear:function(){d={}},key:function(i){return Object.keys(d)[i]||null},get length(){return Object.keys(d).length}}}['localStorage','sessionStorage'].forEach(function(n){try{window[n].getItem('_')}catch(e){try{Object.defineProperty(window,n,{value:m(),configurable:true})}catch(_){}}})})();</script>";
+const STORAGE_SHIM: &str = "(function(){function m(){var d={};return{getItem:function(k){return Object.prototype.hasOwnProperty.call(d,k)?d[k]:null},setItem:function(k,v){d[k]=String(v)},removeItem:function(k){delete d[k]},clear:function(){d={}},key:function(i){return Object.keys(d)[i]||null},get length(){return Object.keys(d).length}}}['localStorage','sessionStorage'].forEach(function(n){try{window[n].getItem('_')}catch(e){try{Object.defineProperty(window,n,{value:m(),configurable:true})}catch(_){}}})})();";
 
 /// 저장소 대체 코드를 문서 앞에 넣는다. `<!doctype ...>` 이 있으면 그 뒤에 넣는다 (앞에 넣으면 호환 모드로 그려진다).
-/// 저장된 파일은 바꾸지 않고 내보낼 때만 붙인다.
-fn with_storage_shim(bytes: Vec<u8>) -> Vec<u8> {
+/// 저장된 파일은 바꾸지 않고 내보낼 때만 붙인다. `extra` 는 같은 script 안에 이어 붙일 코드(설문 제출 함수)다.
+fn with_storage_shim(bytes: Vec<u8>, extra: &str) -> Vec<u8> {
     let lead = bytes.iter().position(|b| !b" \t\r\n".contains(b) && !matches!(b, 0xEF | 0xBB | 0xBF)).unwrap_or(0);
     let at = match bytes.get(lead..lead + 9) {
         Some(head) if head.eq_ignore_ascii_case(b"<!doctype") => {
@@ -626,16 +666,16 @@ fn with_storage_shim(bytes: Vec<u8>) -> Vec<u8> {
         }
         _ => 0,
     };
-    let mut out = Vec::with_capacity(bytes.len() + STORAGE_SHIM.len());
+    let mut out = Vec::with_capacity(bytes.len() + STORAGE_SHIM.len() + extra.len() + 17);
     out.extend_from_slice(&bytes[..at]);
-    out.extend_from_slice(STORAGE_SHIM.as_bytes());
+    out.extend_from_slice(format!("<script>{STORAGE_SHIM}{extra}</script>").as_bytes());
     out.extend_from_slice(&bytes[at..]);
     out
 }
 
 /// 올린 HTML 을 내보내는 응답. sandbox 로 앱과 분리해 실행해서 문서 안의 JS 가 로그인 세션을 쓰지 못하게 한다 (정책서 S1).
 /// allow-same-origin 과 allow-top-navigation 은 주지 않는다. 새 창·알림·폼·다운로드는 출처가 없는 채로 허용해 Claude 결과물이 깨지지 않게 한다.
-fn document_response(bytes: Vec<u8>) -> Response {
+fn document_response(bytes: Vec<u8>, extra: &str) -> Response {
     (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
@@ -648,16 +688,16 @@ fn document_response(bytes: Vec<u8>) -> Response {
             // no-transform: Cloudflare 가 분석·봇 탐지 스크립트를 문서에 끼워 넣지 않게 한다 (격리된 문서에서 오류를 낸다).
             (header::CACHE_CONTROL, "private, no-store, no-transform"),
         ],
-        with_storage_shim(bytes),
+        with_storage_shim(bytes, extra),
     )
         .into_response()
 }
 
-fn not_found() -> Response {
+pub(crate) fn not_found() -> Response {
     (StatusCode::NOT_FOUND, page("없는 문서입니다. <a href=\"/\">목록으로</a>")).into_response()
 }
 
-fn server_error(what: &str, e: impl std::fmt::Display) -> Response {
+pub(crate) fn server_error(what: &str, e: impl std::fmt::Display) -> Response {
     eprintln!("{what} 실패: {e}");
     StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
@@ -1038,7 +1078,9 @@ fn upload_form(app: &AppState, user: &crate::users::User, error: &str, values: (
                  <input id=\"file\" type=\"file\" name=\"file\" accept=\"{accept}\" required>\
                  <span class=\"hint\">HTML, Markdown(.md), SVG, Mermaid(.mmd), React(.jsx) · 10MB 이하</span></div>\
                  <button class=\"btn\">올리기</button></form>\
-                 <p class=\"lede\" style=\"margin-top:24px\">Claude에서 바로 올리려면 <a href=\"/tokens\">내 토큰</a>을 발급받으세요.</p>",
+                 <p class=\"lede\" style=\"margin-top:24px\">Claude에서 바로 올리려면 <a href=\"/tokens\">내 토큰</a>을 발급받으세요.</p>\
+                 <p class=\"lede\" style=\"margin-top:8px\">설문도 됩니다. 문서 스크립트에서 <code>window.htmlhub.submit({{질문: 답}})</code> 을 부르면 \
+                 응답이 직원 이름으로 모이고, 올린 사람이 문서의 '응답' 탭에서 봅니다.</p>",
                 error_box(error),
                 escape(values.0),
                 escape(values.1),
@@ -1116,12 +1158,12 @@ pub async fn upload(State(app): State<AppState>, jar: PrivateCookieJar, form: Mu
     }
 }
 
-fn can_modify(user: &crate::users::User, doc: &Doc) -> bool {
+pub(crate) fn can_modify(user: &crate::users::User, doc: &Doc) -> bool {
     doc.uploader_email == user.email || user.is_admin()
 }
 
 /// 로그인한 직원과 삭제되지 않은 문서를 함께 돌려준다. 안 되면 그대로 돌려줄 응답을 에러로 준다.
-fn user_and_doc(
+pub(crate) fn user_and_doc(
     app: &AppState,
     jar: &PrivateCookieJar,
     id: &str,
@@ -1139,7 +1181,7 @@ fn forbidden() -> Response {
 }
 
 /// 문서 하나에 딸린 화면(이력, 댓글, 새 버전)의 머리말. 이동 경로, 메타 줄, 개수가 붙은 탭. 지금 탭은 링크 대신 글자로 둔다.
-fn doc_header(app: &AppState, doc: &Doc, here: &str) -> String {
+pub(crate) fn doc_header(app: &AppState, doc: &Doc, here: &str) -> String {
     let id = escape(&doc.id);
     let versions = app.docs.versions(&doc.id).map(|v| v.len()).unwrap_or(0);
     let (views, comments) = app.docs.activity(std::slice::from_ref(&doc.id)).unwrap_or_default().get(&doc.id).copied().unwrap_or_default();
@@ -1161,12 +1203,17 @@ fn doc_header(app: &AppState, doc: &Doc, here: &str) -> String {
         "<nav class=\"crumb\" aria-label=\"이동 경로\"><a href=\"/\">문서</a>{crumb_project}</nav>\
          <div class=\"head doc-head\"><div><h1>{}</h1><p class=\"lede\">{project}{sep}{}{sep}{}{sep}7일 열람 {views}</p></div>\
          <a class=\"btn line\" href=\"/d/{id}\">문서 열기</a></div>\
-         <nav class=\"tabs\" aria-label=\"문서 메뉴\">{}{}</nav>",
+         <nav class=\"tabs\" aria-label=\"문서 메뉴\">{}{}{}</nav>",
         escape(&doc.title),
         escape(&doc.uploader_name),
         when(doc.created_at),
         tab(format!("/d/{id}/history"), "이력", versions),
         tab(format!("/d/{id}/comments"), "댓글", comments as usize),
+        // 설문 응답이 있는 문서에만 보인다. 내용은 올린 사람과 관리자만 본다.
+        match app.docs.response_count(&doc.id).unwrap_or(0) {
+            0 if here != "응답" => String::new(),
+            n => tab(format!("/d/{id}/responses"), "응답", n as usize),
+        },
     )
 }
 
@@ -1416,7 +1463,7 @@ pub async fn view_version(
         return r;
     }
     match app.docs.read_version(&id, n) {
-        Ok(Some(bytes)) => document_response(bytes),
+        Ok(Some(bytes)) => document_response(bytes, ""),
         Ok(None) => not_found(),
         Err(e) => server_error("문서 파일 읽기", e),
     }
@@ -1470,9 +1517,10 @@ pub async fn uploaded(State(app): State<AppState>, jar: PrivateCookieJar, Path(i
 }
 
 pub async fn view(State(app): State<AppState>, jar: PrivateCookieJar, Path(id): Path<String>) -> Response {
-    if let Err(r) = current_user_next(&app, &jar, &format!("/d/{id}")) {
-        return r;
-    }
+    let user = match current_user_next(&app, &jar, &format!("/d/{id}")) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
     match app.docs.get(&id) {
         Ok(Some(_)) => match app.docs.read(&id) {
             Ok(bytes) => {
@@ -1480,7 +1528,8 @@ pub async fn view(State(app): State<AppState>, jar: PrivateCookieJar, Path(id): 
                 if let Err(e) = app.docs.record_view(&id) {
                     eprintln!("열람 기록 실패: {e}");
                 }
-                document_response(bytes)
+                // 설문 문서가 응답을 낼 수 있게 이 직원·이 문서에만 통하는 제출 함수를 넣는다.
+                document_response(bytes, &crate::survey::script(&app, &id, &user.email))
             }
             Err(e) => server_error("문서 파일 읽기", e),
         },
@@ -1882,7 +1931,7 @@ mod tests {
 
     #[test]
     fn 문서_응답은_격리_헤더를_붙인다() {
-        let res = document_response(b"<script>1</script>".to_vec());
+        let res = document_response(b"<script>1</script>".to_vec(), "");
         let h = res.headers();
         let csp = h[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
         assert!(csp.starts_with("sandbox allow-scripts"));
@@ -1895,13 +1944,13 @@ mod tests {
 
     #[test]
     fn 저장소_대체_코드는_doctype_뒤에_들어간다() {
-        let out = String::from_utf8(with_storage_shim(b"<!DOCTYPE html>\n<p>a</p>".to_vec())).unwrap();
+        let out = String::from_utf8(with_storage_shim(b"<!DOCTYPE html>\n<p>a</p>".to_vec(), "")).unwrap();
         assert!(out.starts_with("<!DOCTYPE html><script>") && out.ends_with("\n<p>a</p>"), "doctype 이 맨 앞이어야 표준 모드로 그려진다");
-        let out = String::from_utf8(with_storage_shim("\u{feff}  <!doctype html><p>b</p>".as_bytes().to_vec())).unwrap();
+        let out = String::from_utf8(with_storage_shim("\u{feff}  <!doctype html><p>b</p>".as_bytes().to_vec(), "")).unwrap();
         assert!(out.starts_with("\u{feff}  <!doctype html><script>") && out.ends_with("<p>b</p>"));
-        let out = String::from_utf8(with_storage_shim(b"<p>c</p>".to_vec())).unwrap();
+        let out = String::from_utf8(with_storage_shim(b"<p>c</p>".to_vec(), "")).unwrap();
         assert!(out.starts_with("<script>") && out.ends_with("</script><p>c</p>"), "doctype 이 없으면 맨 앞");
-        let out = with_storage_shim(b"<!doctype".to_vec());
+        let out = with_storage_shim(b"<!doctype".to_vec(), "");
         assert!(out.ends_with(b"<!doctype"), "닫히지 않은 doctype 은 건드리지 않고 앞에 붙인다");
     }
 }

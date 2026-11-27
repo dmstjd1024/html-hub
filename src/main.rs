@@ -2,6 +2,7 @@ mod auth;
 mod convert;
 mod docs;
 mod mcp;
+mod survey;
 mod tokens;
 mod users;
 
@@ -27,6 +28,7 @@ pub struct AppState {
     pub key: Key,
     pub secure_cookies: bool,
     pub grants: mcp::Grants,
+    pub survey_keys: survey::Keys,
 }
 
 impl FromRef<AppState> for Key {
@@ -37,11 +39,13 @@ impl FromRef<AppState> for Key {
 
 /// 상태를 바꾸는 요청(POST 등)은 이 사이트의 화면에서 보낸 것만 받는다 (위조 요청 방지).
 /// 격리된 문서 속 폼은 Origin: null 을 보내고, 다른 사이트는 자기 출처를 보낸다. 쿠키가 실려 와도 거절한다.
-/// 토큰으로 받는 /api/upload·/mcp 와 OAuth 토큰 교환·등록은 쿠키를 쓰지 않으므로 검사하지 않는다.
+/// 토큰으로 받는 /api/upload·/mcp 와 OAuth 토큰 교환·등록, 설문 제출(문서에 넣은 제출 열쇠로 확인)은 쿠키를 쓰지 않으므로 검사하지 않는다.
 async fn same_origin_only(State(origin): State<String>, req: Request, next: Next) -> Response {
     let reads = matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
     let from_here = req.headers().get(header::ORIGIN).is_some_and(|o| o.as_bytes() == origin.as_bytes());
-    let tokens_only = matches!(req.uri().path(), "/api/upload" | "/mcp" | "/oauth/token" | "/oauth/register");
+    let path = req.uri().path();
+    let tokens_only = matches!(path, "/api/upload" | "/mcp" | "/oauth/token" | "/oauth/register")
+        || (path.starts_with("/d/") && path.ends_with("/responses"));
     if reads || from_here || tokens_only {
         return next.run(req).await;
     }
@@ -130,6 +134,8 @@ async fn main() -> Result<()> {
         .route("/admin/hidden", get(docs::hidden_list))
         .route("/d/{id}/history", get(docs::history))
         .route("/d/{id}/comments", get(docs::comments_view).post(docs::comment_add))
+        .route("/d/{id}/responses", get(survey::responses_page).post(survey::submit))
+        .route("/d/{id}/responses.csv", get(survey::responses_csv))
         .route("/d/{id}/comments/{cid}/delete", post(docs::comment_delete))
         .route("/d/{id}/v/{n}", get(docs::view_version))
         .route("/d/{id}/restore/{n}", post(docs::restore))
@@ -147,6 +153,7 @@ async fn main() -> Result<()> {
             key: Key::from(session_key.as_bytes()),
             secure_cookies: base_url.starts_with("https://"),
             grants: Default::default(),
+            survey_keys: Default::default(),
         })
         .layer(middleware::from_fn_with_state(origin_of(&base_url), same_origin_only));
 
