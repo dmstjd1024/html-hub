@@ -1,7 +1,13 @@
 #!/bin/sh
 # DB 스냅샷과 문서 파일을 BACKUP_DIR 로 복사한다. 환경변수: DATABASE_PATH, FILES_DIR, BACKUP_DIR
 # 선택: BACKUP_REMOTE (rsync 대상, 예: user@host:backups/html-hub/) 를 주면 다른 기계로도 보낸다.
+# 선택: ALERT_WEBHOOK (Slack 수신 웹후크 주소) 를 주면 실패했을 때 알린다.
 set -eu
+notify() {
+  [ -n "${ALERT_WEBHOOK:-}" ] || return 0
+  curl -fsS -m 10 -H 'Content-Type: application/json' -d "{\"text\":\"$1\"}" "$ALERT_WEBHOOK" >/dev/null || true
+}
+trap 'rc=$?; [ "$rc" -eq 0 ] || { echo "백업 실패: 종료 코드 $rc ($(date "+%F %T"))" >&2; notify "html-hub 백업 실패 (종료 코드 $rc, $(hostname -s))"; }' EXIT
 : "${DATABASE_PATH:?}" "${FILES_DIR:?}" "${BACKUP_DIR:?}"
 umask 077
 mkdir -p "$BACKUP_DIR/db" "$BACKUP_DIR/files"

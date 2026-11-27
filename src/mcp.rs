@@ -218,7 +218,7 @@ pub async fn approve(State(app): State<AppState>, jar: PrivateCookieJar, Form(d)
             code.clone(),
             Grant { email: user.email.clone(), client_id: d.client_id, redirect_uri: d.redirect_uri, challenge: d.code_challenge, client, expires: t + 600 },
         );
-        eprintln!("Claude 연결 승인: {} ({client})", user.email);
+        log!("Claude 연결 승인: {} ({client})", user.email);
         to.query_pairs_mut().append_pair("code", &code);
     } else {
         to.query_pairs_mut().append_pair("error", "access_denied");
@@ -266,7 +266,7 @@ pub async fn token(State(app): State<AppState>, Form(f): Form<TokenForm>) -> Res
         )
             .into_response(),
         Err(e) => {
-            eprintln!("OAuth 토큰 발급 실패: {e}");
+            log!("OAuth 토큰 발급 실패: {e}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -333,7 +333,7 @@ fn call(app: &AppState, user: &User, params: &Value) -> Value {
     match app.docs.insert(title, project, user, &bytes) {
         Ok(id) => reply(format!("{}/d/{id}", base(app)), false),
         Err(e) => {
-            eprintln!("문서 저장 실패: {e}");
+            log!("문서 저장 실패: {e}");
             reply("서버 오류로 올리지 못했습니다.".into(), true)
         }
     }

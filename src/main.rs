@@ -1,3 +1,8 @@
+/// 로그 한 줄 앞에 한국 시각을 붙인다. launchd 가 stderr 를 ~/Library/Logs/html-hub/ 로 모은다.
+macro_rules! log {
+    ($($t:tt)*) => { eprintln!("{} {}", crate::kst_now(), format_args!($($t)*)) };
+}
+
 mod auth;
 mod convert;
 mod docs;
@@ -46,7 +51,7 @@ async fn same_origin_only(State(origin): State<String>, req: Request, next: Next
     if reads || from_here || tokens_only {
         return next.run(req).await;
     }
-    eprintln!("다른 출처의 요청 거절: {} {} (Origin {:?})", req.method(), req.uri().path(), req.headers().get(header::ORIGIN));
+    log!("다른 출처의 요청 거절: {} {} (Origin {:?})", req.method(), req.uri().path(), req.headers().get(header::ORIGIN));
     (StatusCode::FORBIDDEN, auth::page("다른 화면에서 보낸 요청이라 처리하지 않았습니다. <a href=\"/\">목록으로</a>")).into_response()
 }
 
@@ -63,6 +68,22 @@ fn origin_of(base_url: &str) -> String {
     let host = rest.split('/').next().unwrap_or(rest);
     let scheme = base_url.split_once("://").map_or("http", |(s, _)| s);
     format!("{scheme}://{host}")
+}
+
+pub fn kst_now() -> String {
+    let t = time::OffsetDateTime::now_utc().to_offset(time::UtcOffset::from_hms(9, 0, 0).unwrap());
+    format!("{}-{:02}-{:02} {:02}:{:02}:{:02}", t.year(), t.month() as u8, t.day(), t.hour(), t.minute(), t.second())
+}
+
+/// 바깥 감시와 배포 스크립트가 본다. DB 를 읽고 문서 폴더가 있어야 ok.
+async fn healthz(State(app): State<AppState>) -> Response {
+    match app.docs.ping() {
+        Ok(()) => "ok".into_response(),
+        Err(e) => {
+            log!("상태 확인 실패: {e}");
+            (StatusCode::SERVICE_UNAVAILABLE, "unhealthy").into_response()
+        }
+    }
 }
 
 fn env(name: &str) -> Result<String> {
@@ -119,7 +140,7 @@ async fn main() -> Result<()> {
         .route("/login", get(auth::login))
         .route("/auth/callback", get(auth::callback))
         .route("/logout", post(auth::logout))
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/healthz", get(healthz))
         .route("/privacy", get(auth::privacy))
         .route("/terms", get(auth::terms))
         .route("/tokens", get(tokens::tokens_page).post(tokens::tokens_issue))

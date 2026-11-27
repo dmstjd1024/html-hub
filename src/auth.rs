@@ -519,7 +519,7 @@ async fn verified_email(
     }
 
     let fail = |e: &dyn std::fmt::Display| {
-        eprintln!("로그인 실패: {e}");
+        log!("로그인 실패: {e}");
         (StatusCode::BAD_GATEWAY, "구글 로그인에 실패했습니다.")
     };
     let token = app
@@ -569,7 +569,7 @@ pub async fn callback(
             (jar.remove(expired(OAUTH_COOKIE)).add(session), Redirect::to(&next)).into_response()
         }
         Ok(None) => {
-            eprintln!("명단에 없는 로그인 시도: {email}");
+            log!("명단에 없는 로그인 시도: {email}");
             (
                 StatusCode::FORBIDDEN,
                 jar.remove(expired(OAUTH_COOKIE)),
@@ -583,7 +583,7 @@ pub async fn callback(
                 .into_response()
         }
         Err(e) => {
-            eprintln!("명단 조회 실패: {e}");
+            log!("명단 조회 실패: {e}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -610,7 +610,7 @@ pub fn current_user_next(app: &AppState, jar: &PrivateCookieJar, next: &str) -> 
         )
             .into_response()),
         Err(e) => {
-            eprintln!("명단 조회 실패: {e}");
+            log!("명단 조회 실패: {e}");
             Err(StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
     }

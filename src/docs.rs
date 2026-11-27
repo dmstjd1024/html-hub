@@ -313,6 +313,13 @@ impl Docs {
         Ok(())
     }
 
+    /// 상태 확인: DB 를 읽을 수 있고 문서 폴더가 있는가.
+    pub fn ping(&self) -> Result<()> {
+        self.db.lock().unwrap().query_row("SELECT 1", [], |_| Ok(()))?;
+        anyhow::ensure!(self.dir.is_dir(), "문서 폴더가 없다: {}", self.dir.display());
+        Ok(())
+    }
+
     pub fn save_response(&self, id: &str, user: &crate::users::User, answers: &str) -> Result<()> {
         self.db.lock().unwrap().execute(
             "INSERT INTO responses (doc_id, email, name, answers, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
@@ -698,7 +705,7 @@ pub(crate) fn not_found() -> Response {
 }
 
 pub(crate) fn server_error(what: &str, e: impl std::fmt::Display) -> Response {
-    eprintln!("{what} 실패: {e}");
+    log!("{what} 실패: {e}");
     StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
 
@@ -1525,7 +1532,7 @@ pub async fn view(State(app): State<AppState>, jar: PrivateCookieJar, Path(id): 
     };
     // 기록이 실패해도 문서는 보여 준다.
     if let Err(e) = app.docs.record_view(&id) {
-        eprintln!("열람 기록 실패: {e}");
+        log!("열람 기록 실패: {e}");
     }
     let (_, comments) = app.docs.activity(std::slice::from_ref(&doc.id)).unwrap_or_default().get(&doc.id).copied().unwrap_or_default();
     let responses = match app.docs.response_count(&id).unwrap_or(0) {

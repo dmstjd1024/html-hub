@@ -194,7 +194,7 @@ pub async fn tokens_page(State(app): State<AppState>, jar: PrivateCookieJar) -> 
     let info = match app.tokens.info(&user.email) {
         Ok(i) => i,
         Err(e) => {
-            eprintln!("토큰 조회 실패: {e}");
+            log!("토큰 조회 실패: {e}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -229,7 +229,7 @@ pub async fn tokens_page(State(app): State<AppState>, jar: PrivateCookieJar) -> 
                 .collect::<String>()
         ),
         Err(e) => {
-            eprintln!("연결 조회 실패: {e}");
+            log!("연결 조회 실패: {e}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -280,7 +280,7 @@ pub async fn tokens_issue(State(app): State<AppState>, jar: PrivateCookieJar) ->
         )
         .into_response(),
         Err(e) => {
-            eprintln!("토큰 발급 실패: {e}");
+            log!("토큰 발급 실패: {e}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -294,7 +294,7 @@ pub async fn tokens_revoke(State(app): State<AppState>, jar: PrivateCookieJar) -
     match app.tokens.revoke(&user.email) {
         Ok(()) => Redirect::to("/tokens").into_response(),
         Err(e) => {
-            eprintln!("토큰 폐기 실패: {e}");
+            log!("토큰 폐기 실패: {e}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -307,11 +307,11 @@ pub async fn connections_revoke(State(app): State<AppState>, jar: PrivateCookieJ
     };
     match app.tokens.revoke_oauth(&user.email) {
         Ok(()) => {
-            eprintln!("Claude 연결 모두 끊음: {}", user.email);
+            log!("Claude 연결 모두 끊음: {}", user.email);
             Redirect::to("/tokens").into_response()
         }
         Err(e) => {
-            eprintln!("연결 끊기 실패: {e}");
+            log!("연결 끊기 실패: {e}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -331,7 +331,7 @@ pub async fn admin_tokens(State(app): State<AppState>, jar: PrivateCookieJar) ->
     let list = match app.tokens.active() {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("토큰 목록 조회 실패: {e}");
+            log!("토큰 목록 조회 실패: {e}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -385,11 +385,11 @@ pub async fn admin_tokens_revoke(
     };
     match app.tokens.revoke(&form.email) {
         Ok(()) => {
-            eprintln!("관리자 토큰 폐기: {} 가 {} 의 토큰을 폐기", admin.email, form.email);
+            log!("관리자 토큰 폐기: {} 가 {} 의 토큰을 폐기", admin.email, form.email);
             Redirect::to("/admin/tokens").into_response()
         }
         Err(e) => {
-            eprintln!("토큰 폐기 실패: {e}");
+            log!("토큰 폐기 실패: {e}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -434,7 +434,7 @@ pub async fn api_upload(State(app): State<AppState>, headers: HeaderMap, form: M
         )
             .into_response(),
         Err(e) => {
-            eprintln!("문서 저장 실패: {e}");
+            log!("문서 저장 실패: {e}");
             api_error(StatusCode::INTERNAL_SERVER_ERROR, "서버 오류")
         }
     }
