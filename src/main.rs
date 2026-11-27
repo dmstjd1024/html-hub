@@ -169,6 +169,7 @@ async fn main() -> Result<()> {
         .route("/uploaded/{id}", get(docs::uploaded))
         .route("/d/{id}", get(docs::view))
         .route("/d/{id}/raw", get(docs::view_raw))
+        .route("/d/{id}/meta", post(docs::set_meta))
         .route("/d/{id}/delete", post(docs::delete))
         .route("/d/{id}/unhide", post(docs::unhide))
         .route("/admin/hidden", get(docs::hidden_list))

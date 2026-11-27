@@ -313,6 +313,21 @@ impl Docs {
         Ok(())
     }
 
+    /// 제목·프로젝트를 고친다. 링크와 버전은 그대로다.
+    pub fn set_meta(&self, id: &str, title: &str, project: &str) -> Result<()> {
+        self.db.lock().unwrap().execute("UPDATE documents SET title = ?2, project = ?3 WHERE id = ?1", params![id, title, project])?;
+        Ok(())
+    }
+
+    /// 최근 24시간 동안 그 사람이 올린 버전 수 (새 문서와 새 버전 모두).
+    pub fn uploads_today(&self, email: &str) -> Result<i64> {
+        Ok(self.db.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM versions WHERE by_email = ?1 AND created_at > ?2",
+            params![email, now_unix() - 24 * 3600],
+            |r| r.get(0),
+        )?)
+    }
+
     /// 상태 확인: DB 를 읽을 수 있고 문서 폴더가 있는가.
     pub fn ping(&self) -> Result<()> {
         self.db.lock().unwrap().query_row("SELECT 1", [], |_| Ok(()))?;
@@ -1129,6 +1144,26 @@ pub async fn read_form(mut form: Multipart) -> Result<Form, &'static str> {
     Ok(out)
 }
 
+/// 한 사람이 하루(24시간)에 올릴 수 있는 버전 수. 새어 나간 토큰이나 폭주한 에이전트가 디스크를 채우지 못하게 한다 (가정: 200).
+pub const DAILY_UPLOADS: i64 = 200;
+pub const OVER_QUOTA: &str = "하루 올리기 한도(200건)를 넘었습니다. 내일 다시 하거나 관리자에게 문의하세요.";
+
+/// 오늘 더 올릴 수 있는가. 셀 수 없으면 막지 않는다 (올리기를 멈추는 것보다 낫다).
+pub fn within_quota(app: &AppState, email: &str) -> bool {
+    app.docs.uploads_today(email).map_or(true, |n| n < DAILY_UPLOADS)
+}
+
+/// 제목(필수, 200자)·프로젝트(100자) 규칙.
+pub fn check_meta(title: &str, project: &str) -> Result<(), &'static str> {
+    if title.is_empty() {
+        return Err("제목을 입력해 주세요.");
+    }
+    if title.chars().count() > 200 || project.chars().count() > 100 {
+        return Err("제목은 200자, 프로젝트는 100자 이하로 입력해 주세요.");
+    }
+    Ok(())
+}
+
 /// 올린 파일이 규칙(U3·U4)에 맞는지 본다. 맞으면 저장할 HTML 을 돌려준다 (Markdown·SVG·Mermaid·JSX 는 HTML 로 감싼다).
 pub fn check_file(file: Option<(String, axum::body::Bytes)>) -> Result<Vec<u8>, &'static str> {
     let Some((filename, bytes)) = file.filter(|(_, b)| !b.is_empty()) else {
@@ -1159,6 +1194,9 @@ pub async fn upload(State(app): State<AppState>, jar: PrivateCookieJar, form: Mu
         Ok(b) => b,
         Err(msg) => return upload_form(&app, &user, msg, (&form.title, &form.project)),
     };
+    if !within_quota(&app, &user.email) {
+        return upload_form(&app, &user, OVER_QUOTA, (&form.title, &form.project));
+    }
     match app.docs.insert(&form.title, &form.project, &user, &bytes) {
         Ok(id) => Redirect::to(&format!("/uploaded/{id}")).into_response(),
         Err(e) => server_error("문서 저장", e),
@@ -1233,9 +1271,17 @@ fn replace_form(app: &AppState, user: &crate::users::User, doc: &Doc, error: &st
             user,
             "/",
             &format!(
-                "{}<h2>새 버전 올리기</h2>\
+                "{}{}<h2>제목·프로젝트 고치기</h2>\
+                 <form class=\"form\" method=\"post\" action=\"/d/{id}/meta\" style=\"margin-bottom:32px\">\
+                 <div class=\"field\"><label for=\"m-title\">제목</label>\
+                 <input id=\"m-title\" name=\"title\" required maxlength=\"200\" value=\"{title}\"></div>\
+                 <div class=\"field\"><label for=\"m-project\">프로젝트</label>\
+                 <input id=\"m-project\" name=\"project\" maxlength=\"100\" value=\"{project}\">\
+                 <span class=\"hint\">비워 두면 미분류. 링크와 이력은 그대로입니다.</span></div>\
+                 <button class=\"btn line\">저장</button></form>\
+                 <h2>새 버전 올리기</h2>\
                  <p class=\"lede\" style=\"margin-bottom:16px\">링크는 그대로이고 내용만 새 파일로 바뀝니다. 이전 버전은 이력에 남습니다.</p>\
-                 <form class=\"form\" method=\"post\" action=\"/d/{id}/replace\" enctype=\"multipart/form-data\">{}\
+                 <form class=\"form\" method=\"post\" action=\"/d/{id}/replace\" enctype=\"multipart/form-data\">\
                  <div class=\"field\"><label for=\"file\">파일</label>\
                  <input id=\"file\" type=\"file\" name=\"file\" accept=\"{accept}\" required>\
                  <span class=\"hint\">HTML, Markdown(.md), SVG, Mermaid(.mmd), React(.jsx) · 10MB 이하</span></div>\
@@ -1243,11 +1289,44 @@ fn replace_form(app: &AppState, user: &crate::users::User, doc: &Doc, error: &st
                 doc_header(app, doc, ""),
                 error_box(error),
                 id = escape(&doc.id),
+                title = escape(&doc.title),
+                project = escape(&doc.project),
                 accept = crate::convert::ACCEPT,
             ),
         ),
     )
         .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct MetaForm {
+    title: String,
+    #[serde(default)]
+    project: String,
+}
+
+/// 제목·프로젝트 고치기. 올린 사람과 관리자만.
+pub async fn set_meta(
+    State(app): State<AppState>,
+    jar: PrivateCookieJar,
+    Path(id): Path<String>,
+    axum::Form(f): axum::Form<MetaForm>,
+) -> Response {
+    let (user, doc) = match user_and_doc(&app, &jar, &id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if !can_modify(&user, &doc) {
+        return forbidden();
+    }
+    let (title, project) = (f.title.trim(), f.project.trim());
+    if let Err(msg) = check_meta(title, project) {
+        return replace_form(&app, &user, &doc, msg);
+    }
+    match app.docs.set_meta(&id, title, project) {
+        Ok(()) => Redirect::to(&format!("/d/{id}/history")).into_response(),
+        Err(e) => server_error("제목 고치기", e),
+    }
 }
 
 pub async fn replace_page(State(app): State<AppState>, jar: PrivateCookieJar, Path(id): Path<String>) -> Response {
@@ -1279,6 +1358,9 @@ pub async fn replace(
         Ok(b) => b,
         Err(msg) => return replace_form(&app, &user, &doc, msg),
     };
+    if !within_quota(&app, &user.email) {
+        return replace_form(&app, &user, &doc, OVER_QUOTA);
+    }
     match app.docs.replace(&id, &user, &bytes) {
         Ok(_) => Redirect::to(&format!("/d/{id}/history")).into_response(),
         Err(e) => server_error("새 버전 저장", e),

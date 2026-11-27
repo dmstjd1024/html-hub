@@ -427,6 +427,9 @@ pub async fn api_upload(State(app): State<AppState>, headers: HeaderMap, form: M
         Ok(b) => b,
         Err(msg) => return api_error(StatusCode::BAD_REQUEST, msg),
     };
+    if !crate::docs::within_quota(&app, &user.email) {
+        return api_error(StatusCode::TOO_MANY_REQUESTS, crate::docs::OVER_QUOTA);
+    }
     match app.docs.insert(&form.title, &form.project, &user, &bytes) {
         Ok(id) => (
             StatusCode::CREATED,

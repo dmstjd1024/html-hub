@@ -279,64 +279,171 @@ fn unauthorized(app: &AppState) -> Response {
     (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, challenge)], Json(json!({ "error": "invalid_token" }))).into_response()
 }
 
-fn tool() -> Value {
-    json!({
-        "name": "upload_html",
-        "description": "survey(html-hub, 사내 HTML 문서 공유 사이트 survey.eunseong.dev)에 문서를 올리고 공유 링크를 돌려준다. \
-                        Claude 가 만든 아티팩트의 내용 전체를 content 에 그대로 넣는다. 올린 문서는 전 직원이 볼 수 있다. \
-                        설문을 만들 때는 문서 스크립트에서 window.htmlhub.submit({질문: 답}) 을 부르면 된다 (Promise, 실패하면 Error). 부르면 html-hub 가 보는 사람에게 확인 창을 띄우고, 허락하면 그 직원 이름으로 저장된다(취소하면 Error). 한 사람이 다시 내면 덮어쓰며, 올린 사람과 관리자만 html-hub 의 '응답' 탭과 CSV 로 본다. 제출 성공·실패를 화면에 보여 줄 것.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "title": { "type": "string", "description": "문서 제목 (200자 이하)" },
-                "content": { "type": "string", "description": "문서 내용 전체 (10MB 이하)" },
-                "format": {
-                    "type": "string",
-                    "enum": ["html", "md", "svg", "mermaid", "jsx"],
-                    "description": "content 의 종류. 기본 html. jsx 는 export default 하는 React 컴포넌트"
+const FORMAT: &str = "content 의 종류. 기본 html. jsx 는 export default 하는 React 컴포넌트";
+
+fn tools() -> Value {
+    json!([
+        {
+            "name": "upload_html",
+            "description": "survey(html-hub, 사내 HTML 문서 공유 사이트 survey.eunseong.dev)에 새 문서를 올리고 공유 링크를 돌려준다. \
+                            Claude 가 만든 아티팩트의 내용 전체를 content 에 그대로 넣는다. 올린 문서는 전 직원이 볼 수 있다. \
+                            이미 올린 문서를 고치는 것이면 새로 올리지 말고 update_html 을 쓴다 (링크가 그대로 유지된다). \
+                            설문을 만들 때는 문서 스크립트에서 window.htmlhub.submit({질문: 답}) 을 부르면 된다 (Promise, 실패하면 Error). 부르면 html-hub 가 보는 사람에게 확인 창을 띄우고, 허락하면 그 직원 이름으로 저장된다(취소하면 Error). 한 사람이 다시 내면 덮어쓰며, 올린 사람과 관리자만 html-hub 의 '응답' 탭과 CSV 로 본다. 제출 성공·실패를 화면에 보여 줄 것.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "문서 제목 (200자 이하)" },
+                    "content": { "type": "string", "description": "문서 내용 전체 (10MB 이하)" },
+                    "format": { "type": "string", "enum": ["html", "md", "svg", "mermaid", "jsx"], "description": FORMAT },
+                    "project": { "type": "string", "description": "프로젝트 이름 (선택, 100자 이하)" }
                 },
-                "project": { "type": "string", "description": "프로젝트 이름 (선택, 100자 이하)" }
-            },
-            "required": ["title", "content"]
+                "required": ["title", "content"]
+            }
+        },
+        {
+            "name": "update_html",
+            "description": "survey 에 이미 올린 문서를 새 내용으로 바꾼다. 링크는 그대로이고 이전 내용은 이력에 남는다. \
+                            올린 사람(또는 관리자)만 할 수 있다. title·project 를 주면 그것도 고친다. 문서는 링크나 번호로 가리킨다.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "document": { "type": "string", "description": "문서 링크(https://.../d/번호) 또는 번호" },
+                    "content": { "type": "string", "description": "새 내용 전체 (10MB 이하). 제목만 고칠 때는 비워 둔다" },
+                    "format": { "type": "string", "enum": ["html", "md", "svg", "mermaid", "jsx"], "description": FORMAT },
+                    "title": { "type": "string", "description": "새 제목 (선택)" },
+                    "project": { "type": "string", "description": "새 프로젝트 (선택)" }
+                },
+                "required": ["document"]
+            }
+        },
+        {
+            "name": "list_documents",
+            "description": "survey 의 문서를 최근 올린 순으로 찾는다 (최대 20개). 기본은 내가 올린 것. 고칠 문서의 링크를 찾을 때 쓴다.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "제목·올린 사람·본문에서 찾을 말 (선택)" },
+                    "mine": { "type": "boolean", "description": "내가 올린 것만 (기본 true)" }
+                }
+            }
         }
-    })
+    ])
 }
 
-fn call(app: &AppState, user: &User, params: &Value) -> Value {
-    let reply = |text: String, is_error: bool| json!({ "content": [{ "type": "text", "text": text }], "isError": is_error });
-    if params["name"] != "upload_html" {
-        return reply("알 수 없는 도구입니다.".into(), true);
-    }
-    let a = &params["arguments"];
-    let (title, project) = (a["title"].as_str().unwrap_or("").trim(), a["project"].as_str().unwrap_or("").trim());
+fn reply(text: String, is_error: bool) -> Value {
+    json!({ "content": [{ "type": "text", "text": text }], "isError": is_error })
+}
+
+/// content·format 을 검사해 저장할 HTML 로 바꾼다. 파일 이름은 감싼 문서의 <title> 에 쓰인다.
+fn to_bytes(title: &str, a: &Value) -> Result<Vec<u8>, String> {
     let content = a["content"].as_str().unwrap_or("");
-    if title.is_empty() || content.is_empty() {
-        return reply("title 과 content 가 필요합니다.".into(), true);
-    }
-    if title.chars().count() > 200 || project.chars().count() > 100 {
-        return reply("title 은 200자, project 는 100자 이하여야 합니다.".into(), true);
-    }
     let ext = match a["format"].as_str().unwrap_or("html") {
         "html" => "html",
         "md" | "markdown" => "md",
         "svg" => "svg",
         "mermaid" | "mmd" => "mmd",
         "jsx" | "react" => "jsx",
-        _ => return reply("format 은 html, md, svg, mermaid, jsx 중 하나입니다.".into(), true),
+        _ => return Err("format 은 html, md, svg, mermaid, jsx 중 하나입니다.".into()),
     };
-    // 파일 이름은 감싼 문서의 <title> 에 쓰인다.
     let name = format!("{}.{ext}", title.replace(['/', '\\'], " "));
-    let bytes = match check_file(Some((name, axum::body::Bytes::copy_from_slice(content.as_bytes())))) {
-        Ok(b) => b,
-        Err(msg) => return reply(msg.into(), true),
+    check_file(Some((name, axum::body::Bytes::copy_from_slice(content.as_bytes())))).map_err(Into::into)
+}
+
+fn call(app: &AppState, user: &User, params: &Value) -> Value {
+    let a = &params["arguments"];
+    let result = match params["name"].as_str().unwrap_or("") {
+        "upload_html" => upload(app, user, a),
+        "update_html" => update(app, user, a),
+        "list_documents" => list(app, user, a),
+        _ => Err("알 수 없는 도구입니다.".into()),
     };
-    match app.docs.insert(title, project, user, &bytes) {
-        Ok(id) => reply(format!("{}/d/{id}", base(app)), false),
-        Err(e) => {
-            log!("문서 저장 실패: {e}");
-            reply("서버 오류로 올리지 못했습니다.".into(), true)
-        }
+    match result {
+        Ok(text) => reply(text, false),
+        Err(msg) => reply(msg, true),
     }
+}
+
+fn upload(app: &AppState, user: &User, a: &Value) -> Result<String, String> {
+    let (title, project) = (a["title"].as_str().unwrap_or("").trim(), a["project"].as_str().unwrap_or("").trim());
+    if a["content"].as_str().unwrap_or("").is_empty() {
+        return Err("title 과 content 가 필요합니다.".into());
+    }
+    crate::docs::check_meta(title, project)?;
+    let bytes = to_bytes(title, a)?;
+    if !crate::docs::within_quota(app, &user.email) {
+        return Err(crate::docs::OVER_QUOTA.into());
+    }
+    let id = app.docs.insert(title, project, user, &bytes).map_err(|e| {
+        log!("문서 저장 실패: {e}");
+        "서버 오류로 올리지 못했습니다.".to_owned()
+    })?;
+    Ok(format!("{}/d/{id}", base(app)))
+}
+
+fn update(app: &AppState, user: &User, a: &Value) -> Result<String, String> {
+    // 링크(…/d/번호, 뒤에 /history 등이 붙어도 된다) 나 번호만 받는다.
+    let target = a["document"].as_str().unwrap_or("").trim();
+    let id = target.split("/d/").nth(1).unwrap_or(target).split(['/', '?', '#']).next().unwrap_or("");
+    let doc = match app.docs.get(id) {
+        Ok(Some(d)) => d,
+        Ok(None) => return Err("그런 문서가 없습니다. list_documents 로 링크를 찾아 주세요.".into()),
+        Err(e) => {
+            log!("문서 조회 실패: {e}");
+            return Err("서버 오류".into());
+        }
+    };
+    if doc.uploader_email != user.email && !user.is_admin() {
+        return Err("올린 사람이나 관리자만 고칠 수 있습니다.".into());
+    }
+    let title = a["title"].as_str().map(str::trim).unwrap_or(&doc.title).to_owned();
+    let project = a["project"].as_str().map(str::trim).unwrap_or(&doc.project).to_owned();
+    crate::docs::check_meta(&title, &project)?;
+    let has_content = !a["content"].as_str().unwrap_or("").is_empty();
+    if !has_content && title == doc.title && project == doc.project {
+        return Err("content 나 title·project 중 하나는 바꿔야 합니다.".into());
+    }
+    let mut done = Vec::new();
+    if has_content {
+        let bytes = to_bytes(&title, a)?;
+        if !crate::docs::within_quota(app, &user.email) {
+            return Err(crate::docs::OVER_QUOTA.into());
+        }
+        let n = app.docs.replace(id, user, &bytes).map_err(|e| {
+            log!("새 버전 저장 실패: {e}");
+            "서버 오류로 바꾸지 못했습니다.".to_owned()
+        })?;
+        done.push(format!("{n}번째 버전"));
+    }
+    if title != doc.title || project != doc.project {
+        app.docs.set_meta(id, &title, &project).map_err(|e| {
+            log!("제목 고치기 실패: {e}");
+            "서버 오류로 제목을 고치지 못했습니다.".to_owned()
+        })?;
+        done.push("제목·프로젝트".into());
+    }
+    Ok(format!("{} 고쳤습니다: {}/d/{id}", done.join(", "), base(app)))
+}
+
+fn list(app: &AppState, user: &User, a: &Value) -> Result<String, String> {
+    let q = a["query"].as_str().unwrap_or("").trim();
+    let mine = a["mine"].as_bool().unwrap_or(true);
+    let filter = crate::docs::Filter { q, project: None, uploader: if mine { &user.email } else { "" }, sort: crate::docs::Sort::Recent };
+    let docs = app.docs.list(&filter, 0).map_err(|e| {
+        log!("목록 조회 실패: {e}");
+        "서버 오류".to_owned()
+    })?;
+    if docs.is_empty() {
+        return Ok("찾은 문서가 없습니다.".into());
+    }
+    Ok(docs
+        .iter()
+        .take(20)
+        .map(|d| {
+            let project = if d.project.is_empty() { "미분류" } else { &d.project };
+            format!("- {} ({project}, {}) {}/d/{}", d.title, d.uploader_name, base(app), d.id)
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 /// 이 서버가 아는 MCP 규격 판. 클라이언트가 아는 판이면 그대로, 아니면 가장 최근 판으로 답한다.
@@ -345,7 +452,7 @@ fn protocol_version(asked: Option<&str>) -> &str {
     asked.filter(|v| KNOWN.contains(v)).unwrap_or(KNOWN[0])
 }
 
-pub async fn mcp(State(app): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+pub async fn mcp(State(app): State<AppState>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
     let token = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -355,6 +462,11 @@ pub async fn mcp(State(app): State<AppState>, headers: HeaderMap, Json(req): Jso
         Some(Ok(Some(Ok(Some(u))))) => u,
         Some(Err(_)) | Some(Ok(Some(Err(_)))) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         _ => return unauthorized(&app),
+    };
+    // 토큰을 본 뒤에야 본문(최대 20MB)을 해석한다.
+    let Ok(req) = serde_json::from_slice::<Value>(&body) else {
+        let e = json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": "JSON 이 아닙니다." } });
+        return (StatusCode::BAD_REQUEST, Json(e)).into_response();
     };
     if req.is_array() {
         let e = json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32600, "message": "여러 요청을 한 번에 보내는 배치는 지원하지 않습니다." } });
@@ -371,7 +483,7 @@ pub async fn mcp(State(app): State<AppState>, headers: HeaderMap, Json(req): Jso
             "serverInfo": { "name": "html-hub", "version": env!("CARGO_PKG_VERSION") },
         })),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": [tool()] })),
+        "tools/list" => Ok(json!({ "tools": tools() })),
         "tools/call" => Ok(call(&app, &user, &req["params"])),
         _ => Err(json!({ "code": -32601, "message": "지원하지 않는 메서드입니다." })),
     };

@@ -1025,3 +1025,55 @@ async fn 설문_응답은_확인을_거쳐_직원_이름으로_모이고_올린_
     assert!(r.body.starts_with("\u{feff}\"이름\",\"이메일\",\"제출 시각\",\"만족도\",\"의견\",\"고른 것\",\"추가 질문\"\r\n"), "{}", r.body);
     assert!(r.body.contains("\"'=좋아요\"") && r.body.contains(OTHER), "{}", r.body);
 }
+
+// ---------- 고치기와 한도 ----------
+
+#[tokio::test]
+async fn 제목을_고치고_mcp_로_기존_문서를_바꾸며_하루_한도를_지킨다() {
+    use serde_json::json;
+    let s = Server::start().await;
+    let (owner, other) = (s.login(OWNER), s.login(OTHER));
+    let id = s.upload(&owner, "초안", "기획", "<p>v1</p>").await;
+
+    // 제목·프로젝트 고치기: 올린 사람만, 규칙대로.
+    assert_eq!(s.post(&format!("/d/{id}/meta"), Some(&other), &[("title", "남의 것"), ("project", "")]).await.status, StatusCode::FORBIDDEN);
+    assert_eq!(s.post(&format!("/d/{id}/meta"), Some(&owner), &[("title", " "), ("project", "")]).await.status, StatusCode::BAD_REQUEST);
+    let r = s.post(&format!("/d/{id}/meta"), Some(&owner), &[("title", "최종안"), ("project", "")]).await;
+    assert_eq!(r.location(), format!("/d/{id}/history"));
+    let (title, project): (String, String) = s.db().query_row("SELECT title, project FROM documents WHERE id = ?1", [&id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!((title.as_str(), project.as_str()), ("최종안", ""));
+
+    // MCP: 내 문서 찾기 → 링크로 고치기. 남의 문서는 못 고친다.
+    let staff = issue_token(&s, &owner).await;
+    let call = |name: &str, args: serde_json::Value| rpc(1, "tools/call", json!({ "name": name, "arguments": args }));
+    let text = |r: Res| {
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        (v["result"]["isError"].as_bool().unwrap(), v["result"]["content"][0]["text"].as_str().unwrap().to_owned())
+    };
+    let names: Vec<String> = serde_json::from_str::<serde_json::Value>(&send_json(&s, "/mcp", Some(&staff), rpc(1, "tools/list", json!({}))).await.body).unwrap()["result"]["tools"]
+        .as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_owned()).collect();
+    assert_eq!(names, ["upload_html", "update_html", "list_documents"]);
+    let (err, found) = text(send_json(&s, "/mcp", Some(&staff), call("list_documents", json!({}))).await);
+    assert!(!err && found.contains("최종안") && found.contains(&format!("/d/{id}")), "{found}");
+    let link = format!("{}/d/{id}/history", s.base);
+    let (err, msg) = text(send_json(&s, "/mcp", Some(&staff), call("update_html", json!({ "document": link, "content": "# v2", "format": "md", "title": "최종안 2" }))).await);
+    assert!(!err && msg.contains("2번째 버전"), "{msg}");
+    assert!(original(&s.get(&format!("/d/{id}/raw"), Some(&owner)).await.body).contains("<h1>v2</h1>"));
+    let other_token = issue_token(&s, &other).await;
+    let (err, msg) = text(send_json(&s, "/mcp", Some(&other_token), call("update_html", json!({ "document": id, "content": "x" }))).await);
+    assert!(err && msg.contains("올린 사람"), "{msg}");
+    let (err, _) = text(send_json(&s, "/mcp", Some(&staff), call("update_html", json!({ "document": "없는번호", "content": "x" }))).await);
+    assert!(err);
+
+    // 하루 200건을 넘으면 웹·토큰·MCP 모두 막는다.
+    let db = s.db();
+    for n in 100..300 {
+        db.execute("INSERT INTO versions (doc_id, n, file, by_email, by_name, created_at) VALUES (?1, ?2, 'x', ?3, 'x', strftime('%s','now'))", rusqlite::params![id, n, OTHER]).unwrap();
+    }
+    let r = s.multipart("/upload", Some(&other), None, &[("title", "넘침")], Some(("a.html", b"<p>x</p>"))).await;
+    assert!(r.status == StatusCode::BAD_REQUEST && r.body.contains("하루 올리기 한도"), "{}", r.body);
+    assert_eq!(s.multipart("/api/upload", None, Some(&other_token), &[("title", "넘침")], Some(("a.html", b"<p>x</p>"))).await.status, StatusCode::TOO_MANY_REQUESTS);
+    let (err, msg) = text(send_json(&s, "/mcp", Some(&other_token), call("upload_html", json!({ "title": "넘침", "content": "<p>x</p>" }))).await);
+    assert!(err && msg.contains("한도"), "{msg}");
+    assert_eq!(s.multipart("/api/upload", None, Some(&staff), &[("title", "나는 괜찮다")], Some(("a.html", b"<p>x</p>"))).await.status, StatusCode::CREATED);
+}
