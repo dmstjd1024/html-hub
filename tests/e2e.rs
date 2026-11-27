@@ -1077,3 +1077,39 @@ async fn 제목을_고치고_mcp_로_기존_문서를_바꾸며_하루_한도를
     assert!(err && msg.contains("한도"), "{msg}");
     assert_eq!(s.multipart("/api/upload", None, Some(&staff), &[("title", "나는 괜찮다")], Some(("a.html", b"<p>x</p>"))).await.status, StatusCode::CREATED);
 }
+
+#[tokio::test]
+async fn 관리자는_숨긴_문서를_흔적까지_지운다() {
+    let s = Server::start().await;
+    let (owner, admin) = (s.login(OWNER), s.login(ADMIN));
+    let id = s.upload(&owner, "실수로 올린 고객 명단", "", "<p>민감</p>").await;
+    s.multipart(&format!("/d/{id}/replace"), Some(&owner), None, &[], Some(("b.html", b"<p>v2</p>"))).await;
+    s.post(&format!("/d/{id}/comments"), Some(&owner), &[("body", "앗")]).await;
+    let files: Vec<String> = {
+        let db = s.db();
+        let mut st = db.prepare("SELECT file FROM versions WHERE doc_id = ?1").unwrap();
+        st.query_map([&id], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+    };
+    assert_eq!(files.len(), 2);
+
+    // 숨기기 전에는 못 지우고, 관리자만 지운다.
+    assert_eq!(s.post(&format!("/d/{id}/purge"), Some(&admin), &[]).await.status, StatusCode::NOT_FOUND);
+    s.post(&format!("/d/{id}/delete"), Some(&owner), &[]).await;
+    assert_eq!(s.post(&format!("/d/{id}/purge"), Some(&owner), &[]).await.status, StatusCode::FORBIDDEN);
+    assert!(s.get("/admin/hidden", Some(&admin)).await.body.contains(&format!("/d/{id}/purge")));
+    let r = s.post(&format!("/d/{id}/purge"), Some(&admin), &[]).await;
+    assert_eq!(r.location(), "/admin/hidden");
+
+    // 기록·파일이 모두 없어지고, 지운 파일 이름은 백업 정리용으로 남는다.
+    for table in ["documents", "versions", "bodies", "comments"] {
+        let col = if table == "documents" { "id" } else { "doc_id" };
+        let n: i64 = s.db().query_row(&format!("SELECT COUNT(*) FROM {table} WHERE {col} = ?1"), [&id], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0, "{table}");
+    }
+    for f in &files {
+        assert!(!s.dir.join("files").join(f).exists(), "{f}");
+    }
+    let purged = std::fs::read_to_string(s.dir.join("purged.txt")).unwrap();
+    assert!(files.iter().all(|f| purged.lines().any(|l| l == f)), "{purged}");
+    assert_eq!(s.get(&format!("/d/{id}"), Some(&admin)).await.status, StatusCode::NOT_FOUND);
+}

@@ -495,6 +495,37 @@ impl Docs {
         Ok(n > 0)
     }
 
+    /// 숨긴 문서를 흔적까지 지운다 (정책서 D4 의 예외: 실수로 올린 민감 자료). 숨긴 문서만 되고, 숨기지 않았으면 false.
+    /// 지운 파일 이름은 `purged.txt` 에 남겨 다음 백업 때 백업 폴더에서도 지우게 한다.
+    pub fn purge(&self, id: &str) -> Result<bool> {
+        let mut conn = self.db.lock().unwrap();
+        let tx = conn.transaction()?;
+        let hidden: Option<i64> = tx
+            .query_row("SELECT 1 FROM documents WHERE id = ?1 AND deleted_at IS NOT NULL", [id], |r| r.get(0))
+            .optional()?;
+        if hidden.is_none() {
+            return Ok(false);
+        }
+        let files: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT file FROM versions WHERE doc_id = ?1")?;
+            stmt.query_map([id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+        };
+        for table in ["versions", "bodies", "comments", "responses", "views"] {
+            tx.execute(&format!("DELETE FROM {table} WHERE doc_id = ?1"), [id])?;
+        }
+        tx.execute("DELETE FROM documents WHERE id = ?1", [id])?;
+        tx.commit()?;
+        drop(conn);
+        use std::io::Write;
+        let mut list = std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join("..").join("purged.txt"))?;
+        for f in &files {
+            writeln!(list, "{f}")?;
+            // 파일이 이미 없으면 그대로 둔다. 기록은 지웠으므로 다시 보이지 않는다.
+            let _ = std::fs::remove_file(self.dir.join(f));
+        }
+        Ok(true)
+    }
+
     /// 본문(현재 버전)에서 검색어가 처음 나오는 곳 앞 40자부터 120자. 앞뒤가 잘렸으면 … 를 붙인다. 본문에 없으면 None.
     pub fn excerpt(&self, id: &str, q: &str) -> Result<Option<String>> {
         Ok(self
@@ -1688,7 +1719,9 @@ pub async fn hidden_list(State(app): State<AppState>, jar: PrivateCookieJar) -> 
         .map(|d| {
             format!(
                 "<tr><td>{}</td><td>{}</td><td>{}</td><td class=\"when\">{}</td><td class=\"actions\">\
-                 <form method=\"post\" action=\"/d/{id}/unhide\"><button class=\"link\">살리기</button></form></td></tr>",
+                 <form method=\"post\" action=\"/d/{id}/unhide\"><button class=\"link\">살리기</button></form>\
+                 <form method=\"post\" action=\"/d/{id}/purge\" onsubmit=\"return confirm('이 문서의 모든 버전·댓글·응답을 완전히 지웁니다. 되돌릴 수 없습니다. 계속할까요?')\">\
+                 <button class=\"link danger\">완전 삭제</button></form></td></tr>",
                 escape(&d.title),
                 if d.project.is_empty() { "<span class=\"tag none\">미분류</span>".into() } else { format!("<span class=\"tag\">{}</span>", escape(&d.project)) },
                 escape(&d.uploader_name),
@@ -1711,7 +1744,8 @@ pub async fn hidden_list(State(app): State<AppState>, jar: PrivateCookieJar) -> 
         "/admin/hidden",
         &format!(
             "<div class=\"head\"><div><h1>숨긴 문서</h1>\
-             <p class=\"lede\">목록에서 지운 문서입니다. 살리면 목록과 검색에 다시 나오고 링크도 열립니다.</p></div></div>{body}"
+             <p class=\"lede\">목록에서 지운 문서입니다. 살리면 목록과 검색에 다시 나오고 링크도 열립니다. \
+             완전 삭제는 실수로 올린 민감 자료용으로, 모든 버전·댓글·응답을 지우고 다음 백업 때 백업 폴더의 파일도 지웁니다 (DB 백업에는 14일 동안 남습니다).</p></div></div>{body}"
         ),
     )
     .into_response()
@@ -1727,6 +1761,23 @@ pub async fn unhide(State(app): State<AppState>, jar: PrivateCookieJar, Path(id)
         Ok(true) => Redirect::to("/admin/hidden").into_response(),
         Ok(false) => not_found(),
         Err(e) => server_error("문서 살리기", e),
+    }
+}
+
+/// 숨긴 문서를 완전히 지운다. 관리자만.
+pub async fn purge(State(app): State<AppState>, jar: PrivateCookieJar, Path(id): Path<String>) -> Response {
+    let user = match current_user(&app, &jar) {
+        Ok(u) if u.is_admin() => u,
+        Ok(_) => return admin_only(),
+        Err(r) => return r,
+    };
+    match app.docs.purge(&id) {
+        Ok(true) => {
+            log!("문서 완전 삭제: {id} (관리자 {})", user.email);
+            Redirect::to("/admin/hidden").into_response()
+        }
+        Ok(false) => (StatusCode::NOT_FOUND, page("숨긴 문서만 완전히 지울 수 있습니다. 먼저 삭제(숨기기)하세요. <a href=\"/admin/hidden\">숨긴 문서</a>")).into_response(),
+        Err(e) => server_error("문서 완전 삭제", e),
     }
 }
 

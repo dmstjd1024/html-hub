@@ -18,6 +18,14 @@ ls -1 "$BACKUP_DIR"/db/*.db | sort -r | tail -n +15 | while read -r f; do rm -f 
 
 # 숨긴 문서도 영구 보관이므로(정책서 D4) --delete 를 쓰지 않는다.
 rsync -a "$FILES_DIR/" "$BACKUP_DIR/files/"
+# 관리자가 완전 삭제한 문서 파일은 백업에서도 지운다 (서버가 FILES_DIR 옆 purged.txt 에 적는다).
+PURGED="$(dirname "$FILES_DIR")/purged.txt"
+if [ -f "$PURGED" ]; then
+  while IFS= read -r f; do
+    case "$f" in */*|..*|'') continue ;; esac
+    rm -f "$BACKUP_DIR/files/$f"
+  done < "$PURGED"
+fi
 
 if [ -n "${BACKUP_REMOTE:-}" ]; then
   rsync -a "$BACKUP_DIR/" "$BACKUP_REMOTE"

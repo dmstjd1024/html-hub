@@ -172,6 +172,7 @@ async fn main() -> Result<()> {
         .route("/d/{id}/meta", post(docs::set_meta))
         .route("/d/{id}/delete", post(docs::delete))
         .route("/d/{id}/unhide", post(docs::unhide))
+        .route("/d/{id}/purge", post(docs::purge))
         .route("/admin/hidden", get(docs::hidden_list))
         .route("/d/{id}/history", get(docs::history))
         .route("/d/{id}/comments", get(docs::comments_view).post(docs::comment_add))
